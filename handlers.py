@@ -22,7 +22,7 @@ from aiogram.types import (
 
 from db import Database
 from price_parser import fetch_tea_prices
-from utils import calculate_price, format_rubles, main_keyboard
+from utils import format_rubles, main_keyboard
 
 
 MOSCOW_TZ = timezone(timedelta(hours=3), "Europe/Moscow")
@@ -45,6 +45,7 @@ CATEGORY_EMOJIS = {
 
 class Form(StatesGroup):
     searching = State()
+    company_searching = State()
     custom_weight = State()
     cart_weight = State()
     manual_name = State()
@@ -88,9 +89,151 @@ def _button(text: str, callback_data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=callback_data)
 
 
+def _cancel_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[_button("↩️ Отмена", "flow:cancel")]]
+    )
+
+
+def _company_tea_party_price(tea_price_per_10g: int) -> int:
+    if tea_price_per_10g < 200:
+        return 500
+    if tea_price_per_10g < 300:
+        return 700
+    if tea_price_per_10g < 400:
+        return 900
+    if tea_price_per_10g <= 500:
+        return 1100
+    return 1500
+
+
 def _category_label(name: str) -> str:
     emoji = CATEGORY_EMOJIS.get(name, "🍵")
     return f"{emoji} {name}"
+
+
+def _catalog_view(
+    database: Database,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    categories = database.list_categories()
+    if not categories:
+        return (
+            "📚 <b>Каталог пока пуст</b>\n"
+            "Сначала синхронизируйте каталог с сайтом.\n"
+            "Услуги чаепития доступны отдельно.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[[_button("🎎 Чаепитие", "tea-party:open")]]
+            ),
+        )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _button(
+                    f"{_category_label(str(row['name']))} · {row['product_count']}",
+                    f"category:{row['id']}:0",
+                )
+            ]
+            for row in categories
+        ] + [[_button("🎎 Чаепитие", "tea-party:open")]]
+    )
+    return "🍵 <b>Каталог чая</b>\nВыберите категорию:", markup
+
+
+def _tea_party_menu() -> tuple[str, InlineKeyboardMarkup]:
+    return (
+        "🎎 <b>Чаепитие</b>\nВыберите услугу:",
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [_button("🧍 В одного · 500 ₽", "tea-party:solo")],
+                [
+                    _button(
+                        "👥 Компания · выбрать чай",
+                        "tea-party:company:categories",
+                    )
+                ],
+                [_button("🔥 Варка · 350 ₽/человек", "tea-party:boil")],
+                [_button("🍵 К категориям", "catalog:categories")],
+            ]
+        ),
+    )
+
+
+def _tea_party_categories_view(
+    database: Database,
+) -> tuple[str, InlineKeyboardMarkup]:
+    categories = database.list_categories()
+    buttons = [[_button("🔎 Поиск чая", "tea-party:company:search")]]
+    buttons.extend(
+        [
+        [
+            _button(
+                f"{_category_label(str(category['name']))} · "
+                f"{category['product_count']}",
+                f"tea-party:company:category:{category['id']}:0",
+            )
+        ]
+        for category in categories
+        ]
+    )
+    buttons.append([_button("↩️ К услугам чаепития", "tea-party:open")])
+    if not categories:
+        return (
+            "👥 <b>Нет доступных категорий чая</b>",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+    return (
+        "👥 <b>Чаепитие для компании</b>\nВыберите категорию чая:",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+def _tea_party_category_view(
+    database: Database, category_id: int, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    teas = database.list_products(category_id, PAGE_SIZE, page * PAGE_SIZE)
+    count = database.count_products(category_id)
+    category_name = str(teas[0]["category"]) if teas else "Чай"
+    buttons = [
+        [
+            _button(
+                f"{CATEGORY_EMOJIS.get(str(tea['category']), '🍵')} "
+                f"{tea['name']} · {format_rubles(int(tea['price_per_10g']))}/10 г → "
+                f"{format_rubles(_company_tea_party_price(int(tea['price_per_10g'])))}",
+                f"tea-party:company:add:{tea['id']}",
+            )
+        ]
+        for tea in teas
+    ]
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            _button(
+                "‹ Назад",
+                f"tea-party:company:category:{category_id}:{page - 1}",
+            )
+        )
+    if (page + 1) * PAGE_SIZE < count:
+        navigation.append(
+            _button(
+                "Далее ›",
+                f"tea-party:company:category:{category_id}:{page + 1}",
+            )
+        )
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [_button("↩️ К категориям чая", "tea-party:company:categories")]
+    )
+    if not teas:
+        return (
+            "👥 <b>В этой категории нет доступного чая</b>",
+            InlineKeyboardMarkup(inline_keyboard=buttons[-1:]),
+        )
+    return (
+        f"👥 <b>Чаепитие для компании · {escape(category_name)}</b>\n"
+        "Выберите чай — стоимость услуги зависит от цены за 10 г.",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
 
 
 def _parse_positive_int(text: str, field_name: str, minimum: int = 1) -> int:
@@ -104,13 +247,24 @@ def _parse_positive_int(text: str, field_name: str, minimum: int = 1) -> int:
 
 
 def _message_datetime(value: str) -> str:
+    date, time = _message_date_time(value)
+    return f"{date} {time}".strip()
+
+
+def _message_date_time(value: str) -> tuple[str, str]:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        return value
+        return value, ""
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=MOSCOW_TZ)
-    return parsed.astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
+    local = parsed.astimezone(MOSCOW_TZ)
+    return local.strftime("%d.%m.%Y"), local.strftime("%H:%M")
+
+
+def _order_history_label(created_at: str, total_amount: int) -> str:
+    date, time = _message_date_time(created_at)
+    return f"{date}; {time}; {format_rubles(total_amount)}"
 
 
 async def _edit_callback_message(
@@ -126,6 +280,16 @@ async def _edit_callback_message(
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error).lower():
                 raise
+
+
+async def _finish_cart_add(
+    callback: CallbackQuery, database: Database
+) -> None:
+    await callback.answer()
+    if isinstance(callback.message, Message):
+        await callback.message.answer("✅ Выбранная позиция добавлена в корзину.")
+    text, markup = _catalog_view(database)
+    await _edit_callback_message(callback, text, markup)
 
 
 def create_router(database: Database) -> Router:
@@ -160,27 +324,46 @@ def create_router(database: Database) -> Router:
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
+        company_search = await state.get_state() == Form.company_searching.state
         await state.clear()
+        if company_search:
+            text, markup = _tea_party_categories_view(database)
+        else:
+            text, markup = _catalog_view(database)
         await message.answer(
-            "↩️ <b>Действие отменено</b>",
-            reply_markup=main_keyboard(),
+            text,
+            reply_markup=markup,
             parse_mode=ParseMode.HTML,
         )
+
+    @router.callback_query(F.data == "flow:cancel")
+    async def cancel_flow(callback: CallbackQuery, state: FSMContext) -> None:
+        company_search = await state.get_state() == Form.company_searching.state
+        await state.clear()
+        await callback.answer()
+        if company_search:
+            text, markup = _tea_party_categories_view(database)
+        else:
+            text, markup = _catalog_view(database)
+        await _edit_callback_message(callback, text, markup)
 
     @router.message(StateFilter(Form.searching))
     async def search_products(message: Message, state: FSMContext) -> None:
         query = (message.text or "").strip()
-        await state.clear()
         if not query:
-            await message.answer("Введите непустую часть названия.")
+            await message.answer(
+                "Введите непустую часть названия.", reply_markup=_cancel_markup()
+            )
             return
         results = database.search_products(query)
         if not results:
             await message.answer(
                 "🔎 <b>Ничего не найдено</b>\nПопробуйте изменить запрос.",
+                reply_markup=_cancel_markup(),
                 parse_mode=ParseMode.HTML,
             )
             return
+        await state.clear()
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -199,25 +382,75 @@ def create_router(database: Database) -> Router:
             parse_mode=ParseMode.HTML,
         )
 
+    @router.message(StateFilter(Form.company_searching))
+    async def search_company_tea(message: Message, state: FSMContext) -> None:
+        query = (message.text or "").strip()
+        if not query:
+            await message.answer(
+                "Введите название чая для поиска.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+        results = database.search_products(query)
+        if not results:
+            await message.answer(
+                "🔎 <b>Чай не найден</b>\nПопробуйте другой запрос.",
+                reply_markup=_cancel_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await state.clear()
+        buttons = [
+            [
+                _button(
+                    f"{CATEGORY_EMOJIS.get(str(tea['category']), '🍵')} "
+                    f"{tea['name']} · {format_rubles(int(tea['price_per_10g']))}/10 г → "
+                    f"{format_rubles(_company_tea_party_price(int(tea['price_per_10g'])))}",
+                    f"tea-party:company:add:{tea['id']}",
+                )
+            ]
+            for tea in results
+        ]
+        buttons.append(
+            [_button("↩️ К категориям чая", "tea-party:company:categories")]
+        )
+        await message.answer(
+            f"🔎 <b>Результаты поиска чая</b>\nНайдено: {len(results)}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode=ParseMode.HTML,
+        )
+
     @router.message(StateFilter(Form.custom_weight))
-    async def custom_weight(message: Message, state: FSMContext) -> None:
+    async def custom_weight(
+        message: Message, state: FSMContext, user_id: int
+    ) -> None:
         data = await state.get_data()
         try:
             weight = _parse_positive_int(message.text or "", "Граммовка", 5)
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите вес ещё раз или /cancel."
+                f"⚠️ {error}\nВведите вес ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         product = database.get_product(int(data["product_id"]))
-        await state.clear()
         if product is None or not product["is_active"]:
+            await state.clear()
             await message.answer("Товар больше недоступен.")
             return
-        await _show_weight_preview(
-            message, int(product["id"]), weight, str(product["name"]),
-            int(product["price_per_10g"]),
-        )
+        try:
+            database.add_to_cart(user_id, int(product["id"]), weight)
+        except ValueError as error:
+            await message.answer(
+                f"⚠️ {escape(str(error))}",
+                reply_markup=_cancel_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        await state.clear()
+        await message.answer("✅ Выбранная позиция добавлена в корзину.")
+        text, markup = _catalog_view(database)
+        await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
 
     @router.message(StateFilter(Form.cart_weight))
     async def cart_weight_input(
@@ -229,7 +462,8 @@ def create_router(database: Database) -> Router:
             database.update_cart_weight(user_id, int(data["item_id"]), weight)
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите вес ещё раз или /cancel."
+                f"⚠️ {error}\nВведите вес ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         await state.clear()
@@ -240,12 +474,16 @@ def create_router(database: Database) -> Router:
         name = (message.text or "").strip()
         if not name or len(name) > 200:
             await message.answer(
-                "⚠️ Название должно содержать от 1 до 200 символов."
+                "⚠️ Название должно содержать от 1 до 200 символов.",
+                reply_markup=_cancel_markup(),
             )
             return
         await state.update_data(name=name)
         await state.set_state(Form.manual_price)
-        await message.answer("💰 Введите цену за 10 г в целых рублях.")
+        await message.answer(
+            "💰 Введите цену за 10 г в целых рублях.",
+            reply_markup=_cancel_markup(),
+        )
 
     @router.message(StateFilter(Form.manual_price))
     async def manual_product_price(
@@ -255,7 +493,8 @@ def create_router(database: Database) -> Router:
             price = _parse_positive_int(message.text or "", "Цена")
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите цену ещё раз или /cancel."
+                f"⚠️ {error}\nВведите цену ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         data = await state.get_data()
@@ -274,12 +513,16 @@ def create_router(database: Database) -> Router:
         name = (message.text or "").strip()
         if not name or len(name) > 200:
             await message.answer(
-                "⚠️ Название должно содержать от 1 до 200 символов."
+                "⚠️ Название должно содержать от 1 до 200 символов.",
+                reply_markup=_cancel_markup(),
             )
             return
         await state.update_data(name=name)
         await state.set_state(Form.edit_manual_price)
-        await message.answer("💰 Введите новую цену за 10 г в целых рублях.")
+        await message.answer(
+            "💰 Введите новую цену за 10 г в целых рублях.",
+            reply_markup=_cancel_markup(),
+        )
 
     @router.message(StateFilter(Form.edit_manual_price))
     async def manual_edit_price(
@@ -289,7 +532,8 @@ def create_router(database: Database) -> Router:
             price = _parse_positive_int(message.text or "", "Цена")
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите цену ещё раз или /cancel."
+                f"⚠️ {error}\nВведите цену ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         data = await state.get_data()
@@ -309,12 +553,16 @@ def create_router(database: Database) -> Router:
             cash = _parse_positive_int(message.text or "", "Наличные", 0)
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите сумму ещё раз или /cancel."
+                f"⚠️ {error}\nВведите сумму ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         await state.update_data(cash=cash)
         await state.set_state(Form.split_transfer)
-        await message.answer("💳 Введите сумму перевода в целых рублях.")
+        await message.answer(
+            "💳 Введите сумму перевода в целых рублях.",
+            reply_markup=_cancel_markup(),
+        )
 
     @router.message(StateFilter(Form.split_transfer))
     async def split_transfer_input(
@@ -325,7 +573,10 @@ def create_router(database: Database) -> Router:
             transfer = _parse_positive_int(message.text or "", "Перевод", 0)
             order_id = database.checkout(user_id, int(data["cash"]), transfer)
         except ValueError as error:
-            await message.answer(f"⚠️ {error}\nПроверьте суммы или /cancel.")
+            await message.answer(
+                f"⚠️ {error}\nПроверьте суммы.",
+                reply_markup=_cancel_markup(),
+            )
             return
         await state.clear()
         await message.answer(
@@ -340,12 +591,16 @@ def create_router(database: Database) -> Router:
             total = _parse_positive_int(message.text or "", "Общая сумма", 0)
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите сумму ещё раз или /cancel."
+                f"⚠️ {error}\nВведите сумму ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         await state.update_data(total=total)
         await state.set_state(Form.edit_order_cash)
-        await message.answer("💵 Введите новую сумму наличных.")
+        await message.answer(
+            "💵 Введите новую сумму наличных.",
+            reply_markup=_cancel_markup(),
+        )
 
     @router.message(StateFilter(Form.edit_order_cash))
     async def edit_order_cash_input(message: Message, state: FSMContext) -> None:
@@ -353,12 +608,16 @@ def create_router(database: Database) -> Router:
             cash = _parse_positive_int(message.text or "", "Наличные", 0)
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nВведите сумму ещё раз или /cancel."
+                f"⚠️ {error}\nВведите сумму ещё раз.",
+                reply_markup=_cancel_markup(),
             )
             return
         await state.update_data(cash=cash)
         await state.set_state(Form.edit_order_transfer)
-        await message.answer("💳 Введите новую сумму перевода.")
+        await message.answer(
+            "💳 Введите новую сумму перевода.",
+            reply_markup=_cancel_markup(),
+        )
 
     @router.message(StateFilter(Form.edit_order_transfer))
     async def edit_order_transfer_input(
@@ -376,7 +635,8 @@ def create_router(database: Database) -> Router:
             )
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nПроверьте суммы или /cancel, чтобы прервать."
+                f"⚠️ {error}\nПроверьте суммы.",
+                reply_markup=_cancel_markup(),
             )
             return
         order_id = int(data["order_id"])
@@ -397,27 +657,9 @@ def create_router(database: Database) -> Router:
 
     @router.message(F.text.in_({"🍵 Каталог", "Каталог"}))
     async def catalog(message: Message) -> None:
-        categories = database.list_categories()
-        if not categories:
-            await message.answer(
-                "📚 <b>Каталог пока пуст</b>\n"
-                "Сначала синхронизируйте каталог с сайтом.",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    _button(
-                        f"{_category_label(str(row['name']))} · {row['product_count']}",
-                        f"category:{row['id']}:0",
-                    )
-                ]
-                for row in categories
-            ]
-        )
+        text, markup = _catalog_view(database)
         await message.answer(
-            "🍵 <b>Каталог чая</b>\nВыберите категорию:",
+            text,
             reply_markup=markup,
             parse_mode=ParseMode.HTML,
         )
@@ -459,21 +701,97 @@ def create_router(database: Database) -> Router:
     @router.callback_query(F.data == "catalog:categories")
     async def category_list_callback(callback: CallbackQuery) -> None:
         await callback.answer()
-        categories = database.list_categories()
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    _button(
-                        f"{_category_label(str(row['name']))} · {row['product_count']}",
-                        f"category:{row['id']}:0",
-                    )
-                ]
-                for row in categories
-            ]
-        )
+        text, markup = _catalog_view(database)
+        await _edit_callback_message(callback, text, markup)
+
+    @router.callback_query(F.data == "tea-party:open")
+    async def open_tea_party(callback: CallbackQuery) -> None:
+        await callback.answer()
+        text, markup = _tea_party_menu()
+        await _edit_callback_message(callback, text, markup)
+
+    @router.callback_query(F.data == "tea-party:solo")
+    async def add_solo_tea_party(callback: CallbackQuery, user_id: int) -> None:
+        database.add_fixed_service_to_cart(user_id, "Чаепитие — в одного", 500)
+        await _finish_cart_add(callback, database)
+
+    @router.callback_query(F.data == "tea-party:boil")
+    async def choose_boiling_people(callback: CallbackQuery) -> None:
+        await callback.answer()
         await _edit_callback_message(
-            callback, "🍵 <b>Каталог чая</b>\nВыберите категорию:", markup
+            callback,
+            "🔥 <b>Варка</b>\nВыберите количество человек:",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _button(
+                            f"{people} чел. · {format_rubles(350 * people)}",
+                            f"tea-party:boil:add:{people}",
+                        )
+                    ]
+                    for people in range(1, 5)
+                ]
+                + [[_button("↩️ К услугам чаепития", "tea-party:open")]]
+            ),
         )
+
+    @router.callback_query(F.data.startswith("tea-party:boil:add:"))
+    async def add_boiling_service(
+        callback: CallbackQuery, user_id: int
+    ) -> None:
+        people = int((callback.data or "").rsplit(":", 1)[1])
+        if people not in range(1, 5):
+            await callback.answer("Выберите от 1 до 4 человек.", show_alert=True)
+            return
+        amount = 350 * people
+        database.add_fixed_service_to_cart(
+            user_id, f"Варка — {people} чел.", amount
+        )
+        await _finish_cart_add(callback, database)
+
+    @router.callback_query(F.data.startswith("tea-party:company:add:"))
+    async def add_company_tea_party(
+        callback: CallbackQuery, user_id: int
+    ) -> None:
+        tea_id = int((callback.data or "").rsplit(":", 1)[1])
+        tea = database.get_product(tea_id)
+        if tea is None or not tea["is_active"] or tea["source"] == "service":
+            await callback.answer("Чай больше недоступен.", show_alert=True)
+            return
+        amount = _company_tea_party_price(int(tea["price_per_10g"]))
+        database.add_fixed_service_to_cart(
+            user_id,
+            f"Чаепитие для компании — {tea['name']}",
+            amount,
+        )
+        await _finish_cart_add(callback, database)
+
+    @router.callback_query(F.data == "tea-party:company:categories")
+    async def company_tea_party_categories(callback: CallbackQuery) -> None:
+        text, markup = _tea_party_categories_view(database)
+        await callback.answer()
+        await _edit_callback_message(callback, text, markup)
+
+    @router.callback_query(F.data == "tea-party:company:search")
+    async def begin_company_tea_search(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        await state.set_state(Form.company_searching)
+        await callback.answer()
+        await _edit_callback_message(
+            callback,
+            "🔎 <b>Поиск чая для чаепития</b>\nВведите часть названия:",
+            _cancel_markup(),
+        )
+
+    @router.callback_query(F.data.startswith("tea-party:company:category:"))
+    async def company_tea_party_category(callback: CallbackQuery) -> None:
+        _, _, _, category_id_text, page_text = (callback.data or "").split(":")
+        text, markup = _tea_party_category_view(
+            database, int(category_id_text), int(page_text)
+        )
+        await callback.answer()
+        await _edit_callback_message(callback, text, markup)
 
     @router.callback_query(F.data.startswith("product:"))
     async def product_card(callback: CallbackQuery) -> None:
@@ -508,32 +826,33 @@ def create_router(database: Database) -> Router:
 
     @router.callback_query(F.data.startswith("weight:"))
     async def select_weight(
-        callback: CallbackQuery, state: FSMContext
+        callback: CallbackQuery, state: FSMContext, user_id: int
     ) -> None:
         _, product_id_text, weight_text = (callback.data or "").split(":")
         product_id = int(product_id_text)
         product = database.get_product(product_id)
-        await callback.answer()
         if product is None or not product["is_active"]:
+            await callback.answer()
             await _edit_callback_message(callback, "Товар больше недоступен.")
             return
         if weight_text == "custom":
+            await callback.answer()
             await state.update_data(product_id=product_id)
             await state.set_state(Form.custom_weight)
             await _edit_callback_message(
                 callback,
-                "Введите граммовку целым числом (минимум 5 г), "
-                "или отправьте /cancel.",
+                "Введите граммовку целым числом (минимум 5 г).",
+                _cancel_markup(),
             )
             return
         weight = _parse_positive_int(weight_text, "Граммовка", 5)
-        await _edit_weight_preview(
-            callback,
-            product_id,
-            weight,
-            str(product["name"]),
-            int(product["price_per_10g"]),
-        )
+        try:
+            database.add_to_cart(user_id, product_id, weight)
+        except ValueError as error:
+            await callback.answer(str(error), show_alert=True)
+            return
+        await state.clear()
+        await _finish_cart_add(callback, database)
 
     @router.callback_query(F.data.startswith("cart:add:"))
     async def add_product_to_cart(
@@ -546,25 +865,25 @@ def create_router(database: Database) -> Router:
             await callback.answer(str(error), show_alert=True)
             return
         await state.clear()
-        await callback.answer("Добавлено в корзину.")
-        await _edit_callback_message(
-            callback,
-            "Позиция добавлена в корзину.",
-            InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [_button("🛒 Открыть корзину", "cart:show")],
-                    [_button("🍵 Продолжить выбор", "catalog:categories")],
-                ]
-            ),
-        )
+        await _finish_cart_add(callback, database)
 
     @router.message(F.text.in_({"🔎 Поиск", "Поиск"}))
     async def begin_search(message: Message, state: FSMContext) -> None:
         await state.set_state(Form.searching)
         await message.answer(
-            "🔎 <b>Поиск товара</b>\nВведите часть названия или отправьте /cancel.",
+            "🔎 <b>Поиск товара</b>\nВведите часть названия:",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[_button("↩️ Отмена", "search:cancel")]]
+            ),
             parse_mode=ParseMode.HTML,
         )
+
+    @router.callback_query(F.data == "search:cancel")
+    async def cancel_search(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        await callback.answer()
+        text, markup = _catalog_view(database)
+        await _edit_callback_message(callback, text, markup)
 
     @router.message(F.text.in_({"🛒 Корзина", "Корзина"}))
     async def cart(message: Message, user_id: int) -> None:
@@ -579,7 +898,9 @@ def create_router(database: Database) -> Router:
         await state.set_state(Form.cart_weight)
         await callback.answer()
         await _edit_callback_message(
-            callback, "Введите новую граммовку (минимум 5 г) или /cancel."
+            callback,
+            "Введите новую граммовку (минимум 5 г).",
+            _cancel_markup(),
         )
 
     @router.callback_query(F.data.startswith("cart:delete:"))
@@ -613,15 +934,9 @@ def create_router(database: Database) -> Router:
         await edit_cart(callback, user_id)
 
     @router.callback_query(F.data == "cart:clear:cancel")
-    async def cancel_clear_cart(callback: CallbackQuery) -> None:
-        await callback.answer("Очистка отменена.")
-        await _edit_callback_message(
-            callback,
-            "Очистка отменена.",
-            InlineKeyboardMarkup(
-                inline_keyboard=[[_button("🛒 Вернуться в корзину", "cart:show")]]
-            ),
-        )
+    async def cancel_clear_cart(callback: CallbackQuery, user_id: int) -> None:
+        await callback.answer()
+        await edit_cart(callback, user_id)
 
     @router.callback_query(F.data == "cart:show")
     async def open_cart(callback: CallbackQuery, user_id: int) -> None:
@@ -635,6 +950,7 @@ def create_router(database: Database) -> Router:
                 [_button("💵 Наличные", "checkout:cash")],
                 [_button("💳 Перевод", "checkout:transfer")],
                 [_button("💵 + 💳 Смешанная оплата", "checkout:split")],
+                [_button("↩️ Отмена", "flow:cancel")],
             ]
         )
         await callback.answer()
@@ -681,6 +997,7 @@ def create_router(database: Database) -> Router:
             callback,
             "💵 <b>Смешанная оплата</b>\n"
             "Введите сумму наличных в рублях. Затем укажите сумму перевода.",
+            _cancel_markup(),
         )
 
     @router.message(F.text.in_({"🧾 Ручные товары", "Ручные товары"}))
@@ -709,7 +1026,9 @@ def create_router(database: Database) -> Router:
         await state.set_state(Form.manual_name)
         await callback.answer()
         await _edit_callback_message(
-            callback, "Введите название товара или /cancel."
+            callback,
+            "Введите название товара.",
+            _cancel_markup(),
         )
 
     @router.callback_query(F.data.startswith("manual:edit:"))
@@ -728,7 +1047,8 @@ def create_router(database: Database) -> Router:
         await _edit_callback_message(
             callback,
             f"Текущее название: <b>{escape(str(row['name']))}</b>\n"
-            "Введите новое название или /cancel.",
+            "Введите новое название.",
+            _cancel_markup(),
         )
 
     @router.callback_query(F.data.regexp(r"^manual:delete:\d+$"))
@@ -766,13 +1086,24 @@ def create_router(database: Database) -> Router:
 
     @router.callback_query(F.data == "manual:delete:cancel")
     async def cancel_manual_delete(callback: CallbackQuery) -> None:
-        await callback.answer("Удаление отменено.")
+        rows = database.list_manual_products()
+        buttons = [
+            [
+                _button(
+                    f"{row['name']} — {format_rubles(row['price_per_10g'])}/10 г",
+                    f"manual:edit:{row['id']}",
+                ),
+                _button("🗑 Удалить", f"manual:delete:{row['id']}"),
+            ]
+            for row in rows
+        ]
+        buttons.append([_button("➕ Добавить позицию", "manual:add")])
+        await callback.answer()
         await _edit_callback_message(
             callback,
-            "Удаление отменено.",
-            InlineKeyboardMarkup(
-                inline_keyboard=[[_button("🧾 К ручным товарам", "manual:list")]]
-            ),
+            "🧾 <b>Ручные товары</b>\n"
+            "Выберите позицию для изменения или удаления:",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 
     @router.callback_query(F.data == "manual:list")
@@ -859,11 +1190,17 @@ def create_router(database: Database) -> Router:
             "",
         ]
         for item in details["items"]:
-            lines.append(
-                f"• <b>{escape(str(item['product_name']))}</b>\n"
-                f"  {item['weight_g']} г · {format_rubles(item['total_price'])} "
-                f"({format_rubles(item['unit_price_snapshot'])}/10 г)"
-            )
+            if item["is_service"]:
+                lines.append(
+                    f"• <b>{escape(str(item['product_name']))}</b> · "
+                    f"{format_rubles(item['total_price'])}"
+                )
+            else:
+                lines.append(
+                    f"• <b>{escape(str(item['product_name']))}</b>\n"
+                    f"  {item['weight_g']} г · {format_rubles(item['total_price'])} "
+                    f"({format_rubles(item['unit_price_snapshot'])}/10 г)"
+                )
         lines.extend(
             [
                 "",
@@ -925,7 +1262,8 @@ def create_router(database: Database) -> Router:
         await _edit_callback_message(
             callback,
             "Введите новую общую сумму заказа в целых рублях. "
-            "После этого укажите наличные и перевод.\nДля отмены отправьте /cancel.",
+            "После этого укажите наличные и перевод.",
+            _cancel_markup(),
         )
 
     @router.message(F.text.in_({"📊 Отчёт за сегодня", "Отчёт за сегодня"}))
@@ -940,47 +1278,6 @@ def create_router(database: Database) -> Router:
             f"📦 Заказов: {report['order_count']}",
             reply_markup=main_keyboard(),
             parse_mode=ParseMode.HTML,
-        )
-
-    async def _show_weight_preview(
-        message: Message,
-        product_id: int,
-        weight: int,
-        name: str,
-        price_per_10g: int,
-    ) -> None:
-        total = calculate_price(weight, price_per_10g)
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [_button("➕ В корзину", f"cart:add:{product_id}:{weight}")]
-            ]
-        )
-        await message.answer(
-            f"🍃 <b>{escape(name)}</b>\n"
-            f"⚖️ {weight} г · <b>{format_rubles(total)}</b>",
-            reply_markup=markup,
-            parse_mode=ParseMode.HTML,
-        )
-
-    async def _edit_weight_preview(
-        callback: CallbackQuery,
-        product_id: int,
-        weight: int,
-        name: str,
-        price_per_10g: int,
-    ) -> None:
-        total = calculate_price(weight, price_per_10g)
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [_button("➕ В корзину", f"cart:add:{product_id}:{weight}")],
-                [_button("⚖️ Изменить вес", f"product:{product_id}")],
-            ]
-        )
-        await _edit_callback_message(
-            callback,
-            f"🍃 <b>{escape(name)}</b>\n"
-            f"⚖️ {weight} г · <b>{format_rubles(total)}</b>",
-            markup,
         )
 
     async def show_cart(message: Message, user_id: int) -> None:
@@ -1012,16 +1309,25 @@ def create_router(database: Database) -> Router:
         for item in items:
             line_total = int(item["total_price"])
             total += line_total
-            lines.append(
-                f"• <b>{escape(str(item['name']))}</b>\n"
-                f"  {item['weight_g']} г · {format_rubles(line_total)}"
-            )
-            buttons.append(
-                [
-                    _button("⚖️ Изменить вес", f"cart:weight:{item['id']}"),
-                    _button("🗑 Удалить", f"cart:delete:{item['id']}"),
-                ]
-            )
+            if item["is_service"]:
+                lines.append(
+                    f"• <b>{escape(str(item['name']))}</b> · "
+                    f"{format_rubles(line_total)}"
+                )
+                buttons.append(
+                    [_button("🗑 Удалить", f"cart:delete:{item['id']}")]
+                )
+            else:
+                lines.append(
+                    f"• <b>{escape(str(item['name']))}</b>\n"
+                    f"  {item['weight_g']} г · {format_rubles(line_total)}"
+                )
+                buttons.append(
+                    [
+                        _button("⚖️ Изменить вес", f"cart:weight:{item['id']}"),
+                        _button("🗑 Удалить", f"cart:delete:{item['id']}"),
+                    ]
+                )
         lines.extend(
             [
                 "",
@@ -1053,9 +1359,9 @@ def create_router(database: Database) -> Router:
         buttons = [
             [
                 _button(
-                    f"№{order['id']} · {order['telegram_id']} · "
-                    f"{_message_datetime(order['created_at'])} · "
-                    f"{format_rubles(order['total_amount'])}",
+                    _order_history_label(
+                        str(order["created_at"]), int(order["total_amount"])
+                    ),
                     f"order:{order['id']}",
                 )
             ]

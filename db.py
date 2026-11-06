@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from uuid import uuid4
 
 
 MOSCOW_TZ = timezone(timedelta(hours=3), "Europe/Moscow")
@@ -82,7 +83,8 @@ class Database:
                     product_name TEXT NOT NULL,
                     weight_g INTEGER NOT NULL CHECK (weight_g >= 5),
                     unit_price_snapshot INTEGER NOT NULL CHECK (unit_price_snapshot > 0),
-                    total_price INTEGER NOT NULL CHECK (total_price >= 0)
+                    total_price INTEGER NOT NULL CHECK (total_price >= 0),
+                    is_service INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS payments (
                     id INTEGER PRIMARY KEY,
@@ -101,6 +103,24 @@ class Database:
                 );
                 """
             )
+            cart_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(cart_items)")
+            }
+            if "fixed_price" not in cart_columns:
+                connection.execute(
+                    "ALTER TABLE cart_items ADD COLUMN fixed_price INTEGER "
+                    "CHECK (fixed_price IS NULL OR fixed_price > 0)"
+                )
+            order_item_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(order_items)")
+            }
+            if "is_service" not in order_item_columns:
+                connection.execute(
+                    "ALTER TABLE order_items ADD COLUMN is_service "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
 
     def set_allowed_users(self, telegram_ids: set[int]) -> None:
         with self._connect() as connection:
@@ -145,7 +165,7 @@ class Database:
                     SELECT c.id, c.name, COUNT(p.id) AS product_count
                     FROM categories c
                     JOIN products p ON p.category_id = c.id
-                    WHERE p.is_active = 1
+                    WHERE p.is_active = 1 AND p.source != 'service'
                     GROUP BY c.id, c.name
                     ORDER BY c.name COLLATE NOCASE
                     """
@@ -161,6 +181,7 @@ class Database:
                     FROM products p
                     JOIN categories c ON c.id = p.category_id
                     WHERE p.category_id = ? AND p.is_active = 1
+                      AND p.source != 'service'
                     ORDER BY p.name COLLATE NOCASE
                     LIMIT ? OFFSET ?
                     """,
@@ -172,7 +193,7 @@ class Database:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT COUNT(*) AS count FROM products "
-                "WHERE category_id = ? AND is_active = 1",
+                "WHERE category_id = ? AND is_active = 1 AND source != 'service'",
                 (category_id,),
             ).fetchone()
         return int(row["count"])
@@ -185,7 +206,7 @@ class Database:
                     SELECT p.id, p.name, p.price_per_10g, c.name AS category
                     FROM products p
                     JOIN categories c ON c.id = p.category_id
-                    WHERE p.is_active = 1
+                    WHERE p.is_active = 1 AND p.source != 'service'
                     """,
                 )
             )
@@ -208,7 +229,7 @@ class Database:
                 SELECT p.id, p.name, p.price_per_10g, p.source, p.is_active,
                        c.name AS category
                 FROM products p JOIN categories c ON c.id = p.category_id
-                WHERE p.id = ?
+                WHERE p.id = ? AND p.source != 'service'
                 """,
                 (product_id,),
             ).fetchone()
@@ -376,6 +397,13 @@ class Database:
     def _position_total(weight_g: int, price_per_10g: int) -> int:
         return (weight_g * price_per_10g + 9) // 10
 
+    @classmethod
+    def _cart_item_total(cls, item: sqlite3.Row) -> int:
+        fixed_price = item["fixed_price"]
+        if fixed_price is not None:
+            return int(fixed_price)
+        return cls._position_total(item["weight_g"], item["price_snapshot"])
+
     def add_to_cart(self, user_id: int, product_id: int, weight_g: int) -> None:
         if weight_g < 5:
             raise ValueError("Минимальная граммовка — 5 г.")
@@ -384,7 +412,7 @@ class Database:
             connection.execute("BEGIN IMMEDIATE")
             product = connection.execute(
                 "SELECT id, name, price_per_10g FROM products "
-                "WHERE id = ? AND is_active = 1",
+                "WHERE id = ? AND is_active = 1 AND source != 'service'",
                 (product_id,),
             ).fetchone()
             if product is None:
@@ -417,14 +445,55 @@ class Database:
                 ),
             )
 
+    def add_fixed_service_to_cart(
+        self, user_id: int, name: str, amount: int
+    ) -> None:
+        if amount <= 0:
+            raise ValueError("Стоимость услуги должна быть положительной.")
+        now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            category_id = self._category_id(connection, "Чаепитие", "service")
+            product_cursor = connection.execute(
+                """
+                INSERT INTO products
+                    (external_id, name, category_id, price_per_10g, source, is_active)
+                VALUES (?, ?, ?, ?, 'service', 0)
+                """,
+                (f"service:{uuid4().hex}", name, category_id, amount),
+            )
+            product_id = int(product_cursor.lastrowid)
+            connection.execute(
+                """
+                INSERT INTO carts (user_id, created_at, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET updated_at = excluded.updated_at
+                """,
+                (user_id, now, now),
+            )
+            cart = connection.execute(
+                "SELECT id FROM carts WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO cart_items
+                    (cart_id, product_id, product_name, weight_g, price_snapshot, fixed_price)
+                VALUES (?, ?, ?, 10, ?, ?)
+                """,
+                (cart["id"], product_id, name, amount, amount),
+            )
+
     def list_cart_items(self, user_id: int) -> list[sqlite3.Row]:
         with self._connect() as connection:
             return list(
                 connection.execute(
                     """
                     SELECT ci.id, ci.product_id, ci.product_name AS name,
-                           ci.weight_g, ci.price_snapshot,
-                           ((ci.weight_g * ci.price_snapshot + 9) / 10) AS total_price
+                           ci.weight_g, ci.price_snapshot, ci.fixed_price,
+                           (ci.fixed_price IS NOT NULL) AS is_service,
+                           CASE WHEN ci.fixed_price IS NOT NULL THEN ci.fixed_price
+                                ELSE ((ci.weight_g * ci.price_snapshot + 9) / 10)
+                           END AS total_price
                     FROM carts c JOIN cart_items ci ON ci.cart_id = c.id
                     WHERE c.user_id = ? ORDER BY ci.id
                     """,
@@ -440,6 +509,7 @@ class Database:
                 """
                 UPDATE cart_items SET weight_g = ?
                 WHERE id = ? AND cart_id = (SELECT id FROM carts WHERE user_id = ?)
+                  AND fixed_price IS NULL
                 """,
                 (weight_g, item_id, user_id),
             )
@@ -484,10 +554,7 @@ class Database:
             )
             if not items:
                 raise ValueError("Корзина пуста.")
-            total = sum(
-                self._position_total(item["weight_g"], item["price_snapshot"])
-                for item in items
-            )
+            total = sum(self._cart_item_total(item) for item in items)
             if cash + transfer != total:
                 raise ValueError("Наличные и перевод должны равняться сумме заказа.")
 
@@ -500,15 +567,17 @@ class Database:
                 connection.execute(
                     """
                     INSERT INTO order_items
-                        (order_id, product_name, weight_g, unit_price_snapshot, total_price)
-                    VALUES (?, ?, ?, ?, ?)
+                        (order_id, product_name, weight_g, unit_price_snapshot,
+                         total_price, is_service)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         order_id,
                         item["product_name"],
                         item["weight_g"],
                         item["price_snapshot"],
-                        self._position_total(item["weight_g"], item["price_snapshot"]),
+                        self._cart_item_total(item),
+                        int(item["fixed_price"] is not None),
                     ),
                 )
             connection.execute(
@@ -549,7 +618,8 @@ class Database:
                 return None
             items = list(
                 connection.execute(
-                    "SELECT product_name, weight_g, unit_price_snapshot, total_price "
+                    "SELECT product_name, weight_g, unit_price_snapshot, total_price, "
+                    "is_service "
                     "FROM order_items WHERE order_id = ? ORDER BY id",
                     (order_id,),
                 )
