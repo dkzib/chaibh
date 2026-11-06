@@ -1,0 +1,16 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Local data and logs
+*.sqlite
+*.sqlite3
+*.db
+*.log
