@@ -21,6 +21,7 @@ PRODUCTS_PER_PAGE = 30
 EXPECTED_CATEGORY_COUNT = 10
 SOURCE_PRICE_WEIGHT_G = 1
 TARGET_PRICE_WEIGHT_G = 10
+PRODUCT_PAGE_CONCURRENCY = 5
 logger = logging.getLogger(__name__)
 
 
@@ -104,6 +105,72 @@ class _PageConfigParser(HTMLParser):
             self.product_count = count
 
 
+class _ProductLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.product_links: dict[str, str] = {}
+        self._active_anchor: tuple[str, list[str]] | None = None
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        if tag != "a":
+            return
+        href = dict(attrs).get("href")
+        if href and href.startswith("/product/"):
+            self._active_anchor = (href, [])
+
+    def handle_data(self, data: str) -> None:
+        if self._active_anchor is not None:
+            self._active_anchor[1].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._active_anchor is None:
+            return
+        href, text_parts = self._active_anchor
+        self._active_anchor = None
+        name = _normalize_product_name(" ".join(text_parts))
+        if name:
+            self.product_links.setdefault(name, urljoin(SITE_URL, href))
+
+
+class _ProductVariantParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.has_10g_variant = False
+        self._in_variant_select = False
+        self._option_parts: list[str] | None = None
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = dict(attrs)
+        if tag == "select" and attributes.get("name") == "variant_id":
+            self._in_variant_select = True
+        elif tag == "option" and self._in_variant_select:
+            self._option_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._option_parts is not None:
+            self._option_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "option" and self._option_parts is not None:
+            label = " ".join(self._option_parts)
+            self.has_10g_variant |= re.search(
+                r"\bпо\s*10\s*(?:грамм(?:ов)?|гр\.?|г)\b",
+                label,
+                re.IGNORECASE,
+            ) is not None
+            self._option_parts = None
+        elif tag == "select" and self._in_variant_select:
+            self._in_variant_select = False
+
+
+def _normalize_product_name(name: str) -> str:
+    return re.sub(r"[\W_]+", "", name.casefold())
+
+
 def discover_categories(html: str) -> list[Category]:
     parser = _CategoryNavigationParser()
     parser.feed(html)
@@ -133,6 +200,8 @@ def parse_page(
         )
 
     raw_items = json.loads(match.group(1))
+    product_link_parser = _ProductLinkParser()
+    product_link_parser.feed(html)
     products: list[dict[str, Any]] = []
     item_errors = 0
     for item in raw_items:
@@ -163,6 +232,10 @@ def parse_page(
                     "category": category_name,
                     "name": name.strip(),
                     "price_per_10g": rounded_price,
+                    "_source_price": source_price,
+                    "_product_url": product_link_parser.product_links.get(
+                        _normalize_product_name(name)
+                    ),
                 }
             )
         except (InvalidOperation, TypeError, ValueError) as error:
@@ -182,6 +255,19 @@ async def _fetch_catalog(
     async with session.get(CATALOG_URL) as response:
         response.raise_for_status()
         return await response.text()
+
+
+async def _fetch_product_uses_10g_price(
+    session: aiohttp.ClientSession,
+    product_url: str,
+    semaphore: asyncio.Semaphore,
+) -> bool:
+    async with semaphore:
+        async with session.get(product_url) as response:
+            response.raise_for_status()
+            parser = _ProductVariantParser()
+            parser.feed(await response.text())
+            return parser.has_10g_variant
 
 
 async def _fetch_category_page(
@@ -252,6 +338,44 @@ async def fetch_tea_prices() -> tuple[list[dict[str, Any]], int]:
             )
             products.extend(category_products)
             error_count += category_errors
+
+        missing_links = [
+            str(product["name"])
+            for product in products
+            if not product["_product_url"]
+        ]
+        if missing_links:
+            raise ValueError(
+                "Не удалось найти страницы товаров для определения единицы цены: "
+                + ", ".join(missing_links[:5])
+            )
+
+        product_urls = list(
+            dict.fromkeys(str(product["_product_url"]) for product in products)
+        )
+        semaphore = asyncio.Semaphore(PRODUCT_PAGE_CONCURRENCY)
+        detail_results = await asyncio.gather(
+            *(
+                _fetch_product_uses_10g_price(session, url, semaphore)
+                for url in product_urls
+            ),
+            return_exceptions=True,
+        )
+        prices_are_per_10g: dict[str, bool] = {}
+        for url, result in zip(product_urls, detail_results):
+            if isinstance(result, BaseException):
+                raise result
+            prices_are_per_10g[url] = result
+
+        for product in products:
+            product_url = str(product["_product_url"])
+            if prices_are_per_10g[product_url]:
+                price = Decimal(product["_source_price"])
+                product["price_per_10g"] = int(
+                    price.to_integral_value(rounding=ROUND_CEILING)
+                )
+            del product["_source_price"]
+            del product["_product_url"]
 
     return products, error_count
 

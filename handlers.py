@@ -1,13 +1,17 @@
 import asyncio
 from html import escape
+import logging
+import re
+from pathlib import Path
 import sqlite3
+from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
 from aiogram import BaseMiddleware, F, Router
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,18 +20,25 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ErrorEvent,
+    FSInputFile,
     Message,
     TelegramObject,
 )
 
 from db import Database
 from price_parser import fetch_tea_prices
-from utils import format_rubles, main_keyboard
+from settings import (
+    LOG_EXPORT_USER_ID,
+    add_allowed_user_id,
+    remove_allowed_user_id,
+)
+from utils import format_rubles, main_keyboard, settings_keyboard
 
 
 MOSCOW_TZ = timezone(timedelta(hours=3), "Europe/Moscow")
 PAGE_SIZE = 10
 WEIGHT_OPTIONS = (10, 20, 30, 50, 100)
+logger = logging.getLogger(__name__)
 CATEGORY_EMOJIS = {
     "Белый чай": "⚪️",
     "Вулканический чай": "🌋",
@@ -46,6 +57,7 @@ CATEGORY_EMOJIS = {
 class Form(StatesGroup):
     searching = State()
     company_searching = State()
+    catalog_price = State()
     custom_weight = State()
     cart_weight = State()
     manual_name = State()
@@ -57,6 +69,7 @@ class Form(StatesGroup):
     edit_order_total = State()
     edit_order_cash = State()
     edit_order_transfer = State()
+    add_user_id = State()
 
 
 class AccessMiddleware(BaseMiddleware):
@@ -82,6 +95,7 @@ class AccessMiddleware(BaseMiddleware):
             return None
 
         data["user_id"] = user_id
+        data["telegram_user_id"] = user.id
         return await handler(event, data)
 
 
@@ -197,7 +211,7 @@ def _tea_party_category_view(
         [
             _button(
                 f"{CATEGORY_EMOJIS.get(str(tea['category']), '🍵')} "
-                f"{tea['name']} · {format_rubles(int(tea['price_per_10g']))}/10 г → "
+                f"{tea['name']} · {format_rubles(int(tea['price_per_10g']))} за 10 г → "
                 f"{format_rubles(_company_tea_party_price(int(tea['price_per_10g'])))}",
                 f"tea-party:company:add:{tea['id']}",
             )
@@ -232,6 +246,82 @@ def _tea_party_category_view(
     return (
         f"👥 <b>Чаепитие для компании · {escape(category_name)}</b>\n"
         "Выберите чай — стоимость услуги зависит от цены за 10 г.",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+def _price_categories_view(
+    database: Database,
+) -> tuple[str, InlineKeyboardMarkup]:
+    categories = database.list_categories()
+    buttons = [
+        [
+            _button(
+                f"{_category_label(str(category['name']))} · "
+                f"{category['product_count']}",
+                f"price:category:{category['id']}:0",
+            )
+        ]
+        for category in categories
+    ]
+    buttons.append([_button("↩️ Отмена", "flow:cancel")])
+    return (
+        "💰 <b>Изменить цену</b>\nВыберите категорию товара:",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+def _price_products_view(
+    database: Database, category_id: int, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    products = database.list_products(category_id, PAGE_SIZE, page * PAGE_SIZE)
+    count = database.count_products(category_id)
+    category_name = str(products[0]["category"]) if products else "Категория"
+    buttons: list[list[InlineKeyboardButton]] = []
+    for product in products:
+        override_mark = " ✍️" if product["price_override"] else ""
+        buttons.append(
+            [
+                _button(
+                    f"{product['name']} · "
+                    f"{format_rubles(int(product['price_per_10g']))} за 10 г"
+                    f"{override_mark}",
+                    f"price:product:{product['id']}",
+                )
+            ]
+        )
+        if product["price_override"]:
+            buttons.append(
+                [
+                    _button(
+                        f"↩️ Вернуть цену сайта "
+                        f"({format_rubles(int(product['source_price_per_10g']))})",
+                        f"price:reset:{product['id']}",
+                    )
+                ]
+            )
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            _button("‹ Назад", f"price:category:{category_id}:{page - 1}")
+        )
+    if (page + 1) * PAGE_SIZE < count:
+        navigation.append(
+            _button("Далее ›", f"price:category:{category_id}:{page + 1}")
+        )
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [_button("↩️ К категориям", "price:categories")]
+    )
+    if not products:
+        return (
+            "В этой категории нет товаров.",
+            InlineKeyboardMarkup(inline_keyboard=buttons[-1:]),
+        )
+    return (
+        f"💰 <b>Изменить цену · {escape(category_name)}</b>\n"
+        "Выберите товар:",
         InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
@@ -302,6 +392,7 @@ def create_router(database: Database) -> Router:
     async def report_database_error(event: ErrorEvent) -> bool:
         if not isinstance(event.exception, sqlite3.Error):
             raise event.exception
+        logger.exception("Database operation failed while processing update")
         message = event.update.message
         if message is None and event.update.callback_query is not None:
             message = event.update.callback_query.message
@@ -320,6 +411,308 @@ def create_router(database: Database) -> Router:
             "Учёт продаж чая — выберите действие в меню.",
             reply_markup=main_keyboard(),
             parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(F.text == "⚙️ Настройки")
+    async def open_settings(
+        message: Message, state: FSMContext, telegram_user_id: int
+    ) -> None:
+        await state.clear()
+        await message.answer(
+            "⚙️ <b>Настройки</b>\nВыберите действие:",
+            reply_markup=settings_keyboard(telegram_user_id),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(F.text == "⬅️ Назад")
+    async def back_to_main_menu(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(
+            "Главное меню.",
+            reply_markup=main_keyboard(),
+        )
+
+    @router.message(F.text == "📤 Выгрузить логи")
+    async def export_logs(message: Message, user_id: int) -> None:
+        if message.from_user is None or message.from_user.id != LOG_EXPORT_USER_ID:
+            logger.warning("Unauthorized log export attempt: user_id=%s", user_id)
+            await message.answer("У вас нет доступа к выгрузке логов.")
+            return
+
+        log_path = Path(__file__).with_name("bot.log")
+        if not log_path.is_file():
+            logger.warning("Log export failed: log file does not exist")
+            await message.answer("Файл bot.log пока не создан.")
+            return
+
+        try:
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            await message.answer_document(
+                FSInputFile(log_path, filename="bot.log"),
+                caption="📄 Лог-файл бота",
+            )
+        except (OSError, TelegramAPIError):
+            logger.exception("Log export failed: user_id=%s", user_id)
+            await message.answer("⚠️ Не удалось выгрузить файл bot.log.")
+            return
+
+        logger.info("Log file exported: user_id=%s", user_id)
+
+    @router.message(F.text == "🗄 Выгрузить базу")
+    async def export_database(message: Message, user_id: int) -> None:
+        if (
+            message.from_user is None
+            or message.from_user.id != LOG_EXPORT_USER_ID
+        ):
+            logger.warning("Unauthorized database export attempt: user_id=%s", user_id)
+            await message.answer("У вас нет доступа к выгрузке базы данных.")
+            return
+        if message.chat.type != "private" or message.chat.id != LOG_EXPORT_USER_ID:
+            await message.answer(
+                "Для безопасности откройте личный чат с ботом и повторите выгрузку."
+            )
+            return
+
+        try:
+            with TemporaryDirectory(prefix="mini_cash_backup_") as temporary_dir:
+                backup_path = Path(temporary_dir) / "mini_cash.sqlite3"
+                database.backup_to(backup_path)
+                await message.answer_document(
+                    FSInputFile(backup_path, filename="mini_cash_backup.sqlite3"),
+                    caption="🗄 Резервная копия базы Mini Cash",
+                )
+        except (OSError, sqlite3.Error, TelegramAPIError):
+            logger.exception("Database export failed: user_id=%s", user_id)
+            await message.answer("⚠️ Не удалось создать или отправить копию базы.")
+            return
+
+        logger.info("Database backup exported: user_id=%s", user_id)
+
+    @router.message(F.text == "👤 Добавить пользователя")
+    async def begin_add_user(message: Message, state: FSMContext) -> None:
+        await state.set_state(Form.add_user_id)
+        await message.answer(
+            "👤 <b>Добавление пользователя</b>\n"
+            "Отправьте его Telegram ID числом. Пользователь сразу получит доступ "
+            "ко всем функциям бота.",
+            reply_markup=_cancel_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(StateFilter(Form.add_user_id))
+    async def add_user(
+        message: Message,
+        state: FSMContext,
+        user_id: int,
+        telegram_user_id: int,
+    ) -> None:
+        raw_telegram_id = (message.text or "").strip()
+        if not re.fullmatch(r"[0-9]+", raw_telegram_id):
+            await message.answer(
+                "⚠️ Отправьте Telegram ID цифрами.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+
+        telegram_id = int(raw_telegram_id)
+        if telegram_id <= 0 or telegram_id > 2**63 - 1:
+            await message.answer(
+                "⚠️ Telegram ID вне допустимого диапазона.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+
+        try:
+            added_to_env = add_allowed_user_id(telegram_id)
+        except (OSError, ValueError):
+            logger.exception(
+                "Failed to persist allowed user ID: actor_user_id=%s target_user_id=%s",
+                user_id,
+                telegram_id,
+            )
+            await message.answer(
+                "⚠️ Не удалось сохранить ID в .env. Проверьте права на файл и "
+                "попробуйте ещё раз.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+
+        try:
+            database.add_allowed_user(telegram_id)
+        except sqlite3.Error:
+            logger.exception(
+                "Allowed user persisted but could not be activated: "
+                "actor_user_id=%s target_user_id=%s",
+                user_id,
+                telegram_id,
+            )
+            await state.clear()
+            await message.answer(
+                "⚠️ ID сохранён в .env, но не активирован из-за ошибки базы данных. "
+                "Перезапустите бота после проверки bot.log.",
+                reply_markup=settings_keyboard(telegram_user_id),
+            )
+            return
+
+        logger.info(
+            "Allowed user %s: actor_user_id=%s target_user_id=%s",
+            "added" if added_to_env else "already configured and activated",
+            user_id,
+            telegram_id,
+        )
+        await state.clear()
+        await message.answer(
+            f"✅ Пользователь <code>{telegram_id}</code> "
+            f"{'добавлен' if added_to_env else 'уже был в списке'} и теперь "
+            "может пользоваться ботом.",
+            reply_markup=settings_keyboard(telegram_user_id),
+            parse_mode=ParseMode.HTML,
+        )
+
+    def users_removal_view(
+        actor_telegram_id: int,
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        telegram_ids = database.list_active_users()
+        buttons = [
+            [
+                _button(
+                    f"{telegram_id}{' · вы' if telegram_id == actor_telegram_id else ''}",
+                    f"users:remove:select:{telegram_id}",
+                )
+            ]
+            for telegram_id in telegram_ids
+        ]
+        buttons.append([_button("↩️ Закрыть", "users:remove:cancel")])
+        return (
+            "🚫 <b>Удаление пользователя</b>\n"
+            "Выберите ID, чтобы отозвать доступ. История заказов сохранится:",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    @router.message(F.text == "🚫 Удалить пользователя")
+    async def open_user_removal(
+        message: Message, telegram_user_id: int
+    ) -> None:
+        text, markup = users_removal_view(telegram_user_id)
+        await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+    @router.callback_query(F.data == "users:remove:cancel")
+    async def cancel_user_removal(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await _edit_callback_message(
+            callback,
+            "🚫 <b>Удаление отменено</b>\n"
+            "Выберите действие в меню настроек, чтобы продолжить.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("↩️ К списку пользователей", "users:remove:list")]
+                ]
+            ),
+        )
+
+    @router.callback_query(F.data == "users:remove:list")
+    async def user_removal_list(
+        callback: CallbackQuery, telegram_user_id: int
+    ) -> None:
+        text, markup = users_removal_view(telegram_user_id)
+        await callback.answer()
+        await _edit_callback_message(callback, text, markup)
+
+    @router.callback_query(F.data.regexp(r"^users:remove:select:\d+$"))
+    async def confirm_user_removal(callback: CallbackQuery) -> None:
+        target_telegram_id = int((callback.data or "").rsplit(":", 1)[1])
+        target = (
+            f"<code>{target_telegram_id}</code>"
+            if target_telegram_id != callback.from_user.id
+            else f"<code>{target_telegram_id}</code> (это ваш ID)"
+        )
+        await callback.answer()
+        await _edit_callback_message(
+            callback,
+            f"⚠️ <b>Отозвать доступ у пользователя {target}?</b>\n"
+            "Его история заказов сохранится.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _button(
+                            "🚫 Отозвать доступ",
+                            f"users:remove:confirm:{target_telegram_id}",
+                        ),
+                        _button("↩️ Отмена", "users:remove:list"),
+                    ]
+                ]
+            ),
+        )
+
+    @router.callback_query(F.data.regexp(r"^users:remove:confirm:\d+$"))
+    async def remove_user_access(
+        callback: CallbackQuery, user_id: int
+    ) -> None:
+        target_telegram_id = int((callback.data or "").rsplit(":", 1)[1])
+        if target_telegram_id == callback.from_user.id:
+            await callback.answer(
+                "Нельзя отозвать собственный доступ.", show_alert=True
+            )
+            return
+
+        try:
+            deactivated = database.deactivate_allowed_user(target_telegram_id)
+        except ValueError:
+            await callback.answer(
+                "Нельзя отозвать доступ у последнего активного пользователя.",
+                show_alert=True,
+            )
+            return
+        if not deactivated:
+            await callback.answer(
+                "Пользователь не найден или уже отключён.", show_alert=True
+            )
+            return
+
+        try:
+            removed_from_env = remove_allowed_user_id(target_telegram_id)
+        except OSError:
+            logger.exception(
+                "Failed to remove allowed user from .env: actor_user_id=%s target_user_id=%s",
+                user_id,
+                target_telegram_id,
+            )
+            try:
+                database.add_allowed_user(target_telegram_id)
+            except sqlite3.Error:
+                logger.exception(
+                    "Access revoked in database but could not be restored after "
+                    ".env update failure: target_user_id=%s",
+                    target_telegram_id,
+                )
+                await callback.answer(
+                    "Ошибка обновления .env; проверьте bot.log.",
+                    show_alert=True,
+                )
+                return
+            await callback.answer(
+                "Не удалось изменить .env, доступ пользователя восстановлен.",
+                show_alert=True,
+            )
+            return
+
+        logger.info(
+            "User access revoked: actor_user_id=%s target_user_id=%s removed_from_env=%s",
+            user_id,
+            target_telegram_id,
+            removed_from_env,
+        )
+        await callback.answer("Доступ отозван.")
+        await _edit_callback_message(
+            callback,
+            f"✅ Доступ пользователя <code>{target_telegram_id}</code> отозван. "
+            "История заказов сохранена.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_button("👤 К списку пользователей", "users:remove:list")]
+                ]
+            ),
         )
 
     @router.message(Command("cancel"))
@@ -369,7 +762,7 @@ def create_router(database: Database) -> Router:
                 [
                     _button(
                         f"{CATEGORY_EMOJIS.get(str(row['category']), '🍵')} "
-                        f"{row['name']} · {format_rubles(row['price_per_10g'])}/10 г",
+                        f"{row['name']} · {format_rubles(row['price_per_10g'])} за 10 г",
                         f"product:{row['id']}",
                     )
                 ]
@@ -404,7 +797,7 @@ def create_router(database: Database) -> Router:
             [
                 _button(
                     f"{CATEGORY_EMOJIS.get(str(tea['category']), '🍵')} "
-                    f"{tea['name']} · {format_rubles(int(tea['price_per_10g']))}/10 г → "
+                    f"{tea['name']} · {format_rubles(int(tea['price_per_10g']))} за 10 г → "
                     f"{format_rubles(_company_tea_party_price(int(tea['price_per_10g'])))}",
                     f"tea-party:company:add:{tea['id']}",
                 )
@@ -418,6 +811,68 @@ def create_router(database: Database) -> Router:
             f"🔎 <b>Результаты поиска чая</b>\nНайдено: {len(results)}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(StateFilter(Form.catalog_price))
+    async def set_catalog_price(
+        message: Message,
+        state: FSMContext,
+        user_id: int,
+        telegram_user_id: int,
+    ) -> None:
+        try:
+            price = _parse_positive_int(message.text or "", "Цена за 10 г")
+        except ValueError as error:
+            await message.answer(
+                f"⚠️ {error}\nВведите новую цену.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+        data = await state.get_data()
+        product_id = int(data["product_id"])
+        previous_product = database.get_product(product_id)
+        if not database.update_catalog_product_price(product_id, price):
+            await state.clear()
+            await message.answer(
+                "⚠️ Товар больше недоступен в каталоге.",
+                reply_markup=settings_keyboard(telegram_user_id),
+            )
+            return
+        logger.info(
+            "Catalog price manually changed: user_id=%s product_id=%s old_price=%s new_price=%s",
+            user_id,
+            product_id,
+            previous_product["price_per_10g"] if previous_product else None,
+            price,
+        )
+        await state.clear()
+        product = database.get_product(product_id)
+        if product is None:
+            await message.answer(
+                "Цена обновлена, но товар больше недоступен в каталоге.",
+                reply_markup=settings_keyboard(telegram_user_id),
+            )
+            return
+        reset_markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    _button(
+                        "↩️ Вернуть цену сайта "
+                        f"({format_rubles(int(product['source_price_per_10g']))})",
+                        f"price:reset:{product_id}",
+                    )
+                ]
+            ]
+        )
+        await message.answer(
+            f"✅ Цена обновлена: <b>{format_rubles(price)}</b> за 10 г.\n"
+            "Ручная цена будет действовать до следующей синхронизации каталога.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=settings_keyboard(telegram_user_id),
+        )
+        await message.answer(
+            "При необходимости можно сразу восстановить цену сайта:",
+            reply_markup=reset_markup,
         )
 
     @router.message(StateFilter(Form.custom_weight))
@@ -447,6 +902,12 @@ def create_router(database: Database) -> Router:
                 parse_mode=ParseMode.HTML,
             )
             return
+        logger.info(
+            "Product added to cart: user_id=%s product_id=%s weight_g=%s",
+            user_id,
+            product["id"],
+            weight,
+        )
         await state.clear()
         await message.answer("✅ Выбранная позиция добавлена в корзину.")
         text, markup = _catalog_view(database)
@@ -466,6 +927,12 @@ def create_router(database: Database) -> Router:
                 reply_markup=_cancel_markup(),
             )
             return
+        logger.info(
+            "Cart item weight changed: user_id=%s item_id=%s weight_g=%s",
+            user_id,
+            data["item_id"],
+            weight,
+        )
         await state.clear()
         await show_cart(message, user_id)
 
@@ -487,7 +954,10 @@ def create_router(database: Database) -> Router:
 
     @router.message(StateFilter(Form.manual_price))
     async def manual_product_price(
-        message: Message, state: FSMContext
+        message: Message,
+        state: FSMContext,
+        user_id: int,
+        telegram_user_id: int,
     ) -> None:
         try:
             price = _parse_positive_int(message.text or "", "Цена")
@@ -499,12 +969,18 @@ def create_router(database: Database) -> Router:
             return
         data = await state.get_data()
         product_id = database.add_manual_product(str(data["name"]), price)
+        logger.info(
+            "Manual product added: user_id=%s product_id=%s price_per_10g=%s",
+            user_id,
+            product_id,
+            price,
+        )
         await state.clear()
         await message.answer(
             f"✅ <b>Товар добавлен</b>\n"
             f"{escape(str(data['name']))}\n"
             f"{format_rubles(price)} за 10 г",
-            reply_markup=main_keyboard(),
+            reply_markup=settings_keyboard(telegram_user_id),
             parse_mode=ParseMode.HTML,
         )
 
@@ -526,7 +1002,7 @@ def create_router(database: Database) -> Router:
 
     @router.message(StateFilter(Form.edit_manual_price))
     async def manual_edit_price(
-        message: Message, state: FSMContext
+        message: Message, state: FSMContext, user_id: int
     ) -> None:
         try:
             price = _parse_positive_int(message.text or "", "Цена")
@@ -537,11 +1013,23 @@ def create_router(database: Database) -> Router:
             )
             return
         data = await state.get_data()
+        product_id = int(data["product_id"])
         if not database.update_manual_product(
-            int(data["product_id"]), str(data["name"]), price
+            product_id, str(data["name"]), price
         ):
+            logger.warning(
+                "Manual product update failed: user_id=%s product_id=%s",
+                user_id,
+                product_id,
+            )
             await message.answer("⚠️ Ручной товар не найден или уже удалён.")
         else:
+            logger.info(
+                "Manual product updated: user_id=%s product_id=%s price_per_10g=%s",
+                user_id,
+                product_id,
+                price,
+            )
             await message.answer("✅ Товар обновлён.")
         await state.clear()
 
@@ -578,6 +1066,14 @@ def create_router(database: Database) -> Router:
                 reply_markup=_cancel_markup(),
             )
             return
+        logger.info(
+            "Order completed: user_id=%s order_id=%s cash=%s transfer=%s total=%s",
+            user_id,
+            order_id,
+            data["cash"],
+            transfer,
+            int(data["cash"]) + transfer,
+        )
         await state.clear()
         await message.answer(
             f"✅ <b>Заказ №{order_id} оформлен</b>",
@@ -640,6 +1136,14 @@ def create_router(database: Database) -> Router:
             )
             return
         order_id = int(data["order_id"])
+        logger.info(
+            "Order finances updated: user_id=%s order_id=%s total=%s cash=%s transfer=%s",
+            user_id,
+            order_id,
+            data["total"],
+            data["cash"],
+            transfer,
+        )
         await state.clear()
         await message.answer(
             f"✅ <b>Финансы заказа №{order_id} обновлены</b>",
@@ -664,6 +1168,85 @@ def create_router(database: Database) -> Router:
             parse_mode=ParseMode.HTML,
         )
 
+    @router.message(
+        F.text.in_(
+            {
+                "💰 Изменить цену товара",
+                "💰 Изменить цену",
+                "Изменить цену",
+            }
+        )
+    )
+    async def begin_catalog_price_change(message: Message) -> None:
+        text, markup = _price_categories_view(database)
+        await message.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+
+    @router.callback_query(F.data == "price:categories")
+    async def price_categories(callback: CallbackQuery) -> None:
+        text, markup = _price_categories_view(database)
+        await callback.answer()
+        await _edit_callback_message(callback, text, markup)
+
+    @router.callback_query(F.data.startswith("price:category:"))
+    async def price_category_page(callback: CallbackQuery) -> None:
+        _, _, category_id, page = (callback.data or "").split(":")
+        text, markup = _price_products_view(
+            database, int(category_id), int(page)
+        )
+        await callback.answer()
+        await _edit_callback_message(callback, text, markup)
+
+    @router.callback_query(F.data.startswith("price:product:"))
+    async def begin_price_entry(
+        callback: CallbackQuery, state: FSMContext
+    ) -> None:
+        product_id = int((callback.data or "").rsplit(":", 1)[1])
+        product = database.get_product(product_id)
+        if product is None or not product["is_active"]:
+            await callback.answer("Товар больше недоступен.", show_alert=True)
+            return
+        await state.update_data(product_id=product_id)
+        await state.set_state(Form.catalog_price)
+        await callback.answer()
+        await _edit_callback_message(
+            callback,
+            f"💰 <b>{escape(str(product['name']))}</b>\n"
+            f"Текущая цена: {format_rubles(int(product['price_per_10g']))} за 10 г.\n"
+            "Введите новую цену целым числом в рублях:",
+            _cancel_markup(),
+        )
+
+    @router.callback_query(F.data.startswith("price:reset:"))
+    async def reset_catalog_price(callback: CallbackQuery, user_id: int) -> None:
+        product_id = int((callback.data or "").rsplit(":", 1)[1])
+        if not database.reset_catalog_product_price(product_id):
+            await callback.answer("У товара нет ручной цены.", show_alert=True)
+            return
+        product = database.get_product(product_id)
+        logger.info(
+            "Catalog price reset to site price: user_id=%s product_id=%s price=%s",
+            user_id,
+            product_id,
+            product["price_per_10g"] if product else None,
+        )
+        await callback.answer("Цена сайта восстановлена.")
+        if product is None:
+            await _edit_callback_message(callback, "Товар больше недоступен.")
+            return
+        category_id = next(
+            (
+                int(category["id"])
+                for category in database.list_categories()
+                if str(category["name"]) == str(product["category"])
+            ),
+            None,
+        )
+        if category_id is None:
+            text, markup = _price_categories_view(database)
+        else:
+            text, markup = _price_products_view(database, category_id, 0)
+        await _edit_callback_message(callback, text, markup)
+
     @router.callback_query(F.data.startswith("category:"))
     async def category_page(callback: CallbackQuery) -> None:
         _, category_id_text, page_text = (callback.data or "").split(":")
@@ -676,7 +1259,7 @@ def create_router(database: Database) -> Router:
             [
                 _button(
                     f"{CATEGORY_EMOJIS.get(str(row['category']), '🍵')} "
-                    f"{row['name']} · {format_rubles(row['price_per_10g'])}/10 г",
+                    f"{row['name']} · {format_rubles(row['price_per_10g'])} за 10 г",
                     f"product:{row['id']}",
                 )
             ]
@@ -713,6 +1296,7 @@ def create_router(database: Database) -> Router:
     @router.callback_query(F.data == "tea-party:solo")
     async def add_solo_tea_party(callback: CallbackQuery, user_id: int) -> None:
         database.add_fixed_service_to_cart(user_id, "Чаепитие — в одного", 500)
+        logger.info("Service added to cart: user_id=%s service=solo amount=500", user_id)
         await _finish_cart_add(callback, database)
 
     @router.callback_query(F.data == "tea-party:boil")
@@ -747,6 +1331,12 @@ def create_router(database: Database) -> Router:
         database.add_fixed_service_to_cart(
             user_id, f"Варка — {people} чел.", amount
         )
+        logger.info(
+            "Service added to cart: user_id=%s service=boiling people=%s amount=%s",
+            user_id,
+            people,
+            amount,
+        )
         await _finish_cart_add(callback, database)
 
     @router.callback_query(F.data.startswith("tea-party:company:add:"))
@@ -762,6 +1352,12 @@ def create_router(database: Database) -> Router:
         database.add_fixed_service_to_cart(
             user_id,
             f"Чаепитие для компании — {tea['name']}",
+            amount,
+        )
+        logger.info(
+            "Service added to cart: user_id=%s service=company tea_product_id=%s amount=%s",
+            user_id,
+            tea_id,
             amount,
         )
         await _finish_cart_add(callback, database)
@@ -851,6 +1447,12 @@ def create_router(database: Database) -> Router:
         except ValueError as error:
             await callback.answer(str(error), show_alert=True)
             return
+        logger.info(
+            "Product added to cart: user_id=%s product_id=%s weight_g=%s",
+            user_id,
+            product_id,
+            weight,
+        )
         await state.clear()
         await _finish_cart_add(callback, database)
 
@@ -864,6 +1466,12 @@ def create_router(database: Database) -> Router:
         except ValueError as error:
             await callback.answer(str(error), show_alert=True)
             return
+        logger.info(
+            "Product added to cart: user_id=%s product_id=%s weight_g=%s",
+            user_id,
+            product_id_text,
+            weight_text,
+        )
         await state.clear()
         await _finish_cart_add(callback, database)
 
@@ -909,6 +1517,12 @@ def create_router(database: Database) -> Router:
     ) -> None:
         item_id = int((callback.data or "").split(":")[2])
         removed = database.remove_cart_item(user_id, item_id)
+        logger.info(
+            "Cart item removal %s: user_id=%s item_id=%s",
+            "succeeded" if removed else "not_found",
+            user_id,
+            item_id,
+        )
         await callback.answer("Позиция удалена." if removed else "Позиция не найдена.")
         await edit_cart(callback, user_id)
 
@@ -930,6 +1544,7 @@ def create_router(database: Database) -> Router:
     @router.callback_query(F.data == "cart:clear:confirm")
     async def clear_cart(callback: CallbackQuery, user_id: int) -> None:
         database.clear_cart(user_id)
+        logger.info("Cart cleared: user_id=%s", user_id)
         await callback.answer("Корзина очищена.")
         await edit_cart(callback, user_id)
 
@@ -974,6 +1589,13 @@ def create_router(database: Database) -> Router:
         except ValueError as error:
             await callback.answer(str(error), show_alert=True)
             return
+        logger.info(
+            "Order completed: user_id=%s order_id=%s total=%s payment_method=%s",
+            user_id,
+            order_id,
+            total,
+            "cash" if cash else "transfer",
+        )
         await state.clear()
         await callback.answer("Заказ оформлен.")
         await _edit_callback_message(
@@ -1006,7 +1628,7 @@ def create_router(database: Database) -> Router:
         buttons = [
             [
                 _button(
-                    f"✍️ {row['name']} · {format_rubles(row['price_per_10g'])}/10 г",
+                    f"✍️ {row['name']} · {format_rubles(row['price_per_10g'])} за 10 г",
                     f"manual:edit:{row['id']}",
                 ),
                 _button("🗑 Удалить", f"manual:delete:{row['id']}"),
@@ -1068,9 +1690,17 @@ def create_router(database: Database) -> Router:
         )
 
     @router.callback_query(F.data.startswith("manual:delete:confirm:"))
-    async def delete_manual_product(callback: CallbackQuery) -> None:
+    async def delete_manual_product(
+        callback: CallbackQuery, user_id: int
+    ) -> None:
         product_id = int((callback.data or "").split(":")[3])
         deleted = database.deactivate_manual_product(product_id)
+        logger.info(
+            "Manual product deletion %s: user_id=%s product_id=%s",
+            "succeeded" if deleted else "not_found",
+            user_id,
+            product_id,
+        )
         await callback.answer("Товар удалён." if deleted else "Товар не найден.")
         await _edit_callback_message(
             callback,
@@ -1090,7 +1720,7 @@ def create_router(database: Database) -> Router:
         buttons = [
             [
                 _button(
-                    f"{row['name']} — {format_rubles(row['price_per_10g'])}/10 г",
+                    f"{row['name']} — {format_rubles(row['price_per_10g'])} за 10 г",
                     f"manual:edit:{row['id']}",
                 ),
                 _button("🗑 Удалить", f"manual:delete:{row['id']}"),
@@ -1112,7 +1742,7 @@ def create_router(database: Database) -> Router:
         buttons = [
             [
                 _button(
-                    f"{row['name']} — {format_rubles(row['price_per_10g'])}/10 г",
+                    f"{row['name']} — {format_rubles(row['price_per_10g'])} за 10 г",
                     f"manual:edit:{row['id']}",
                 ),
                 _button("🗑 Удалить", f"manual:delete:{row['id']}"),
@@ -1129,11 +1759,15 @@ def create_router(database: Database) -> Router:
         )
 
     @router.message(F.text.in_({"🔄 Синхронизировать каталог", "Синхронизировать каталог"}))
-    async def sync_catalog(message: Message) -> None:
+    async def sync_catalog(message: Message, user_id: int) -> None:
         status = await message.answer("Получаю каталог сайта…")
         try:
             products, parser_errors = await fetch_tea_prices()
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+            logger.exception(
+                "Catalog fetch failed: user_id=%s",
+                user_id,
+            )
             await status.edit_text(
                 f"⚠️ <b>Не удалось получить каталог</b>\n{escape(str(error))}",
                 parse_mode=ParseMode.HTML,
@@ -1142,12 +1776,25 @@ def create_router(database: Database) -> Router:
         try:
             updated, errors, changes = database.sync_site_products(products)
         except sqlite3.Error as error:
+            logger.exception(
+                "Catalog database synchronization failed: user_id=%s",
+                user_id,
+            )
             await status.edit_text(
                 "⚠️ <b>Ошибка базы данных при синхронизации</b>\n"
                 f"{escape(str(error))}",
                 parse_mode=ParseMode.HTML,
             )
             return
+        logger.info(
+            "Catalog synchronization completed: user_id=%s products=%s updated=%s "
+            "errors=%s price_changes=%s",
+            user_id,
+            len(products),
+            updated,
+            errors + parser_errors,
+            len(changes),
+        )
         await status.edit_text(
             "🔄 <b>Синхронизация завершена</b>\n"
             f"Обновлено: <b>{updated}</b>\n"
@@ -1199,7 +1846,7 @@ def create_router(database: Database) -> Router:
                 lines.append(
                     f"• <b>{escape(str(item['product_name']))}</b>\n"
                     f"  {item['weight_g']} г · {format_rubles(item['total_price'])} "
-                    f"({format_rubles(item['unit_price_snapshot'])}/10 г)"
+                    f"({format_rubles(item['unit_price_snapshot'])} за 10 г)"
                 )
         lines.extend(
             [
@@ -1267,16 +1914,24 @@ def create_router(database: Database) -> Router:
         )
 
     @router.message(F.text.in_({"📊 Отчёт за сегодня", "Отчёт за сегодня"}))
-    async def today_report(message: Message) -> None:
+    async def today_report(message: Message, telegram_user_id: int) -> None:
         today = datetime.now(MOSCOW_TZ).date().isoformat()
         report = database.today_report(today)
+        logger.info(
+            "Daily report viewed: date=%s total=%s cash=%s transfer=%s orders=%s",
+            today,
+            report["total"],
+            report["cash"],
+            report["transfer"],
+            report["order_count"],
+        )
         await message.answer(
             f"📊 <b>Отчёт за {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n"
             f"Всего: <b>{format_rubles(report['total'])}</b>\n"
             f"💵 Наличные: {format_rubles(report['cash'])}\n"
             f"💳 Переводы: {format_rubles(report['transfer'])}\n"
             f"📦 Заказов: {report['order_count']}",
-            reply_markup=main_keyboard(),
+            reply_markup=settings_keyboard(telegram_user_id),
             parse_mode=ParseMode.HTML,
         )
 

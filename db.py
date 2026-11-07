@@ -29,6 +29,15 @@ class Database:
         finally:
             connection.close()
 
+    def backup_to(self, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as source:
+            backup = sqlite3.connect(destination, timeout=30)
+            try:
+                source.backup(backup)
+            finally:
+                backup.close()
+
     def initialize(self) -> None:
         with self._connect() as connection:
             connection.executescript(
@@ -49,6 +58,8 @@ class Database:
                     name TEXT NOT NULL,
                     category_id INTEGER NOT NULL REFERENCES categories(id),
                     price_per_10g INTEGER NOT NULL CHECK (price_per_10g > 0),
+                    source_price_per_10g INTEGER NOT NULL DEFAULT 0,
+                    price_override INTEGER NOT NULL DEFAULT 0,
                     source TEXT NOT NULL,
                     is_active INTEGER NOT NULL DEFAULT 1
                 );
@@ -121,6 +132,24 @@ class Database:
                     "ALTER TABLE order_items ADD COLUMN is_service "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            product_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(products)")
+            }
+            if "source_price_per_10g" not in product_columns:
+                connection.execute(
+                    "ALTER TABLE products ADD COLUMN source_price_per_10g "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "price_override" not in product_columns:
+                connection.execute(
+                    "ALTER TABLE products ADD COLUMN price_override "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.execute(
+                "UPDATE products SET source_price_per_10g = price_per_10g "
+                "WHERE source_price_per_10g = 0"
+            )
 
     def set_allowed_users(self, telegram_ids: set[int]) -> None:
         with self._connect() as connection:
@@ -132,6 +161,51 @@ class Database:
                 """,
                 [(telegram_id,) for telegram_id in telegram_ids],
             )
+
+    def add_allowed_user(self, telegram_id: int) -> None:
+        if telegram_id <= 0:
+            raise ValueError("Telegram ID must be positive")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO users (telegram_id, is_active) VALUES (?, 1)
+                ON CONFLICT(telegram_id) DO UPDATE SET is_active = 1
+                """,
+                (telegram_id,),
+            )
+
+    def list_active_users(self) -> list[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT telegram_id FROM users WHERE is_active = 1 "
+                "ORDER BY telegram_id"
+            ).fetchall()
+        return [int(row["telegram_id"]) for row in rows]
+
+    def deactivate_allowed_user(self, telegram_id: int) -> bool:
+        if telegram_id <= 0:
+            raise ValueError("Telegram ID must be positive")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            target = connection.execute(
+                "SELECT 1 FROM users WHERE telegram_id = ? AND is_active = 1",
+                (telegram_id,),
+            ).fetchone()
+            if target is None:
+                return False
+            active_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) AS count FROM users WHERE is_active = 1"
+                ).fetchone()["count"]
+            )
+            if active_count <= 1:
+                raise ValueError("Cannot deactivate the last active user")
+            cursor = connection.execute(
+                "UPDATE users SET is_active = 0 "
+                "WHERE telegram_id = ? AND is_active = 1",
+                (telegram_id,),
+            )
+        return cursor.rowcount == 1
 
     def get_active_user_id(self, telegram_id: int) -> int | None:
         with self._connect() as connection:
@@ -177,7 +251,9 @@ class Database:
             return list(
                 connection.execute(
                     """
-                    SELECT p.id, p.name, p.price_per_10g, c.name AS category
+                    SELECT p.id, p.name, p.price_per_10g, p.price_override,
+                           p.source_price_per_10g,
+                           c.name AS category
                     FROM products p
                     JOIN categories c ON c.id = p.category_id
                     WHERE p.category_id = ? AND p.is_active = 1
@@ -198,12 +274,39 @@ class Database:
             ).fetchone()
         return int(row["count"])
 
+    def update_catalog_product_price(self, product_id: int, price: int) -> bool:
+        if price <= 0:
+            raise ValueError("Цена должна быть положительным числом.")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE products SET price_per_10g = ?, price_override = 1
+                WHERE id = ? AND is_active = 1 AND source != 'service'
+                """,
+                (price, product_id),
+            )
+        return cursor.rowcount == 1
+
+    def reset_catalog_product_price(self, product_id: int) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE products
+                SET price_per_10g = source_price_per_10g, price_override = 0
+                WHERE id = ? AND is_active = 1 AND source != 'service'
+                  AND price_override = 1
+                """,
+                (product_id,),
+            )
+        return cursor.rowcount == 1
+
     def search_products(self, query: str, limit: int = 20) -> list[sqlite3.Row]:
         with self._connect() as connection:
             rows = list(
                 connection.execute(
                     """
-                    SELECT p.id, p.name, p.price_per_10g, c.name AS category
+                    SELECT p.id, p.name, p.price_per_10g, p.price_override,
+                           c.name AS category
                     FROM products p
                     JOIN categories c ON c.id = p.category_id
                     WHERE p.is_active = 1 AND p.source != 'service'
@@ -226,7 +329,9 @@ class Database:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT p.id, p.name, p.price_per_10g, p.source, p.is_active,
+                SELECT p.id, p.name, p.price_per_10g, p.source_price_per_10g,
+                       p.price_override,
+                       p.source, p.is_active,
                        c.name AS category
                 FROM products p JOIN categories c ON c.id = p.category_id
                 WHERE p.id = ? AND p.source != 'service'
@@ -240,10 +345,11 @@ class Database:
             cursor = connection.execute(
                 """
                 INSERT INTO products
-                    (name, category_id, price_per_10g, source, is_active)
-                VALUES (?, ?, ?, 'manual', 1)
+                    (name, category_id, price_per_10g, source_price_per_10g,
+                     source, is_active)
+                VALUES (?, ?, ?, ?, 'manual', 1)
                 """,
-                (name.strip(), category_id, price),
+                (name.strip(), category_id, price, price),
             )
             return int(cursor.lastrowid)
 
@@ -265,10 +371,11 @@ class Database:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                UPDATE products SET name = ?, price_per_10g = ?
+                UPDATE products SET name = ?, price_per_10g = ?,
+                    source_price_per_10g = ?, price_override = 0
                 WHERE id = ? AND source = 'manual' AND is_active = 1
                 """,
-                (name.strip(), price, product_id),
+                (name.strip(), price, price, product_id),
             )
         return cursor.rowcount == 1
 
@@ -345,10 +452,11 @@ class Database:
                         connection.execute(
                             """
                             INSERT INTO products
-                                (external_id, name, category_id, price_per_10g, source, is_active)
-                            VALUES (?, ?, ?, ?, 'site', 1)
+                                (external_id, name, category_id, price_per_10g,
+                                 source_price_per_10g, source, is_active)
+                            VALUES (?, ?, ?, ?, ?, 'site', 1)
                             """,
-                            (external_id, name, category_id, price),
+                            (external_id, name, category_id, price, price),
                         )
                         changed = True
                     elif existing["source"] == "manual":
@@ -360,11 +468,15 @@ class Database:
                         ):
                             raise ValueError("External ID conflicts with existing product")
                         old_price = int(existing["price_per_10g"])
+                        old_source_price = int(existing["source_price_per_10g"])
+                        price_override = bool(existing["price_override"])
                         changed = (
                             existing["external_id"] != external_id
                             or existing["name"] != name
                             or int(existing["category_id"]) != category_id
+                            or old_source_price != price
                             or old_price != price
+                            or price_override
                             or not bool(existing["is_active"])
                         )
                         if changed:
@@ -372,10 +484,18 @@ class Database:
                                 """
                                 UPDATE products SET external_id = ?, name = ?,
                                     category_id = ?, price_per_10g = ?,
-                                    source = 'site', is_active = 1
+                                    source_price_per_10g = ?,
+                                    price_override = 0, source = 'site', is_active = 1
                                 WHERE id = ?
                                 """,
-                                (external_id, name, category_id, price, existing["id"]),
+                                (
+                                    external_id,
+                                    name,
+                                    category_id,
+                                    price,
+                                    price,
+                                    existing["id"],
+                                ),
                             )
                             if old_price != price:
                                 price_change = {
