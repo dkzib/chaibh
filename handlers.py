@@ -66,9 +66,11 @@ class Form(StatesGroup):
     edit_manual_price = State()
     split_cash = State()
     split_transfer = State()
+    split_terminal = State()
     edit_order_total = State()
     edit_order_cash = State()
     edit_order_transfer = State()
+    edit_order_terminal = State()
     add_user_id = State()
 
 
@@ -1048,31 +1050,102 @@ def create_router(database: Database) -> Router:
         await state.update_data(cash=cash)
         await state.set_state(Form.split_transfer)
         await message.answer(
-            "💳 Введите сумму перевода в целых рублях.",
+            "💳 <b>Шаг 2 из 3 — перевод.</b> Введите сумму перевода "
+            "в целых рублях.",
             reply_markup=_cancel_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
     @router.message(StateFilter(Form.split_transfer))
     async def split_transfer_input(
-        message: Message, state: FSMContext, user_id: int
+        message: Message, state: FSMContext
     ) -> None:
         data = await state.get_data()
         try:
             transfer = _parse_positive_int(message.text or "", "Перевод", 0)
-            order_id = database.checkout(user_id, int(data["cash"]), transfer)
         except ValueError as error:
             await message.answer(
                 f"⚠️ {error}\nПроверьте суммы.",
                 reply_markup=_cancel_markup(),
             )
             return
+        await state.update_data(transfer=transfer)
+        await state.set_state(Form.split_terminal)
+        await message.answer(
+            "🏧 <b>Шаг 3 из 3 — терминал.</b> Введите сумму оплаты "
+            "терминалом в целых рублях.",
+            reply_markup=_cancel_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(StateFilter(Form.split_terminal))
+    async def split_terminal_input(
+        message: Message, state: FSMContext, user_id: int
+    ) -> None:
+        data = await state.get_data()
+        try:
+            terminal = _parse_positive_int(message.text or "", "Терминал", 0)
+        except ValueError as error:
+            await message.answer(
+                f"⚠️ {error}\nВведите сумму терминала целым числом рублей.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+
+        order_total = int(data["order_total"])
+        cash = int(data["cash"])
+        transfer = int(data["transfer"])
+        expected_terminal = order_total - cash - transfer
+        if expected_terminal < 0:
+            await state.update_data(cash=0, transfer=0)
+            await state.set_state(Form.split_cash)
+            await message.answer(
+                "⚠️ <b>Наличные и перевод уже превышают сумму заказа.</b>\n"
+                f"Сумма заказа: <b>{format_rubles(order_total)}</b>\n"
+                f"Указано наличными и переводом: "
+                f"<b>{format_rubles(cash + transfer)}</b>\n"
+                "Начните распределение заново: введите сумму наличными "
+                "для первого шага.",
+                reply_markup=_cancel_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if terminal != expected_terminal:
+            await message.answer(
+                "⚠️ <b>Суммы не сходятся.</b>\n"
+                f"Сумма заказа: <b>{format_rubles(order_total)}</b>\n"
+                f"Наличные: {format_rubles(cash)}\n"
+                f"Перевод: {format_rubles(transfer)}\n"
+                f"Ожидаемая сумма терминалом: "
+                f"<b>{format_rubles(expected_terminal)}</b>\n"
+                "<b>Введите сумму терминалом.</b>",
+                reply_markup=_cancel_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        try:
+            order_id = database.checkout(
+                user_id,
+                cash,
+                transfer,
+                terminal,
+            )
+        except ValueError as error:
+            await message.answer(
+                f"⚠️ Не удалось оформить заказ: {error}",
+                reply_markup=_cancel_markup(),
+            )
+            return
         logger.info(
-            "Order completed: user_id=%s order_id=%s cash=%s transfer=%s total=%s",
+            "Order completed: user_id=%s order_id=%s cash=%s transfer=%s "
+            "terminal=%s total=%s",
             user_id,
             order_id,
             data["cash"],
-            transfer,
-            int(data["cash"]) + transfer,
+            data["transfer"],
+            terminal,
+            int(data["cash"]) + int(data["transfer"]) + terminal,
         )
         await state.clear()
         await message.answer(
@@ -1094,8 +1167,9 @@ def create_router(database: Database) -> Router:
         await state.update_data(total=total)
         await state.set_state(Form.edit_order_cash)
         await message.answer(
-            "💵 Введите новую сумму наличных.",
+            "💵 <b>Шаг 1 из 3 — наличные.</b> Введите новую сумму наличными.",
             reply_markup=_cancel_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
     @router.message(StateFilter(Form.edit_order_cash))
@@ -1111,38 +1185,104 @@ def create_router(database: Database) -> Router:
         await state.update_data(cash=cash)
         await state.set_state(Form.edit_order_transfer)
         await message.answer(
-            "💳 Введите новую сумму перевода.",
+            "💳 <b>Шаг 2 из 3 — перевод.</b> Введите новую сумму перевода.",
             reply_markup=_cancel_markup(),
+            parse_mode=ParseMode.HTML,
         )
 
     @router.message(StateFilter(Form.edit_order_transfer))
     async def edit_order_transfer_input(
+        message: Message, state: FSMContext
+    ) -> None:
+        try:
+            transfer = _parse_positive_int(message.text or "", "Перевод", 0)
+        except ValueError as error:
+            await message.answer(
+                f"⚠️ {error}\nВведите сумму ещё раз.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+        await state.update_data(transfer=transfer)
+        await state.set_state(Form.edit_order_terminal)
+        data = await state.get_data()
+        await message.answer(
+            "🏧 <b>Шаг 3 из 3 — терминал.</b> Введите новую сумму оплаты "
+            f"терминалом.\nСумма заказа: <b>{format_rubles(int(data['total']))}</b>.",
+            reply_markup=_cancel_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(StateFilter(Form.edit_order_terminal))
+    async def edit_order_terminal_input(
         message: Message, state: FSMContext, user_id: int
     ) -> None:
         data = await state.get_data()
         try:
-            transfer = _parse_positive_int(message.text or "", "Перевод", 0)
+            terminal = _parse_positive_int(message.text or "", "Терминал", 0)
+        except ValueError as error:
+            await message.answer(
+                f"⚠️ {error}\nВведите сумму терминала целым числом рублей.",
+                reply_markup=_cancel_markup(),
+            )
+            return
+
+        total = int(data["total"])
+        cash = int(data["cash"])
+        transfer = int(data["transfer"])
+        expected_terminal = total - cash - transfer
+        if expected_terminal < 0:
+            await state.update_data(cash=0, transfer=0)
+            await state.set_state(Form.edit_order_cash)
+            await message.answer(
+                "⚠️ <b>Наличные и перевод превышают сумму заказа.</b>\n"
+                f"Сумма заказа: <b>{format_rubles(total)}</b>\n"
+                f"Уже указано наличными и переводом: "
+                f"<b>{format_rubles(cash + transfer)}</b>\n"
+                "Введите сумму наличными заново, затем бот попросит "
+                "перевод и терминал.",
+                reply_markup=_cancel_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if terminal != expected_terminal:
+            await message.answer(
+                "⚠️ <b>Суммы оплат не совпадают с суммой заказа.</b>\n"
+                f"Сумма заказа: <b>{format_rubles(total)}</b>\n"
+                f"Наличные: {format_rubles(cash)}\n"
+                f"Перевод: {format_rubles(transfer)}\n"
+                f"Ожидаемая сумма терминалом: "
+                f"<b>{format_rubles(expected_terminal)}</b>\n"
+                "<b>Введите сумму терминалом.</b>",
+                reply_markup=_cancel_markup(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        try:
             database.update_order_finances(
                 int(data["order_id"]),
                 user_id,
-                int(data["total"]),
-                int(data["cash"]),
+                total,
+                cash,
                 transfer,
+                terminal,
             )
         except ValueError as error:
             await message.answer(
-                f"⚠️ {error}\nПроверьте суммы.",
+                f"⚠️ Не удалось сохранить суммы: {error}",
                 reply_markup=_cancel_markup(),
             )
             return
         order_id = int(data["order_id"])
         logger.info(
-            "Order finances updated: user_id=%s order_id=%s total=%s cash=%s transfer=%s",
+            "Order finances updated: user_id=%s order_id=%s total=%s cash=%s "
+            "transfer=%s terminal=%s",
             user_id,
             order_id,
             data["total"],
             data["cash"],
-            transfer,
+            data["transfer"],
+            terminal,
         )
         await state.clear()
         await message.answer(
@@ -1564,7 +1704,8 @@ def create_router(database: Database) -> Router:
             inline_keyboard=[
                 [_button("💵 Наличные", "checkout:cash")],
                 [_button("💳 Перевод", "checkout:transfer")],
-                [_button("💵 + 💳 Смешанная оплата", "checkout:split")],
+                [_button("🏧 Терминал", "checkout:terminal")],
+                [_button("💵 + 💳 + 🏧 Разделить оплату", "checkout:split")],
                 [_button("↩️ Отмена", "flow:cancel")],
             ]
         )
@@ -1573,7 +1714,9 @@ def create_router(database: Database) -> Router:
             callback, "💳 <b>Оплата заказа</b>\nВыберите способ оплаты:", markup
         )
 
-    @router.callback_query(F.data.in_({"checkout:cash", "checkout:transfer"}))
+    @router.callback_query(
+        F.data.in_({"checkout:cash", "checkout:transfer", "checkout:terminal"})
+    )
     async def checkout_single_payment(
         callback: CallbackQuery, user_id: int, state: FSMContext
     ) -> None:
@@ -1584,8 +1727,9 @@ def create_router(database: Database) -> Router:
             return
         cash = total if callback.data == "checkout:cash" else 0
         transfer = total if callback.data == "checkout:transfer" else 0
+        terminal = total if callback.data == "checkout:terminal" else 0
         try:
-            order_id = database.checkout(user_id, cash, transfer)
+            order_id = database.checkout(user_id, cash, transfer, terminal)
         except ValueError as error:
             await callback.answer(str(error), show_alert=True)
             return
@@ -1594,7 +1738,13 @@ def create_router(database: Database) -> Router:
             user_id,
             order_id,
             total,
-            "cash" if cash else "transfer",
+            (
+                "cash"
+                if cash
+                else "transfer"
+                if transfer
+                else "terminal"
+            ),
         )
         await state.clear()
         await callback.answer("Заказ оформлен.")
@@ -1611,14 +1761,24 @@ def create_router(database: Database) -> Router:
 
     @router.callback_query(F.data == "checkout:split")
     async def checkout_split(
-        callback: CallbackQuery, state: FSMContext
+        callback: CallbackQuery, state: FSMContext, user_id: int
     ) -> None:
+        items = database.list_cart_items(user_id)
+        total = sum(int(item["total_price"]) for item in items)
+        if not items:
+            await callback.answer("Корзина пуста.", show_alert=True)
+            return
+        await state.update_data(order_total=total)
         await state.set_state(Form.split_cash)
         await callback.answer()
         await _edit_callback_message(
             callback,
             "💵 <b>Смешанная оплата</b>\n"
-            "Введите сумму наличных в рублях. Затем укажите сумму перевода.",
+            f"Сумма заказа: <b>{format_rubles(total)}</b>\n\n"
+            "<b>Шаг 1 из 3 — наличные.</b> Введите сумму наличными "
+            "в целых рублях.\n"
+            "Затем бот попросит сумму перевода и оплаты терминалом. "
+            "Сумма всех трёх частей должна равняться сумме заказа.",
             _cancel_markup(),
         )
 
@@ -1852,17 +2012,69 @@ def create_router(database: Database) -> Router:
             [
                 "",
                 f"<b>Итого: {format_rubles(order['total_amount'])}</b>",
-                f"💵 Наличные: {format_rubles(order['cash_amount'])}",
                 f"💳 Перевод: {format_rubles(order['transfer_amount'])}",
+                f"💵 Наличные: {format_rubles(order['cash_amount'])}",
+                f"🏧 Терминал: {format_rubles(order['terminal_amount'])}",
             ]
         )
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
                 [_button("✏️ Изменить суммы", f"order:edit:{order_id}")],
                 [_button("📝 История правок", f"order:audit:{order_id}")],
+                [_button("🗑 Удалить заказ", f"order:delete:{order_id}")],
+                [_button("‹ Назад к списку заказов", "orders:0")],
             ]
         )
         await _edit_callback_message(callback, "\n".join(lines), markup)
+
+    @router.callback_query(F.data.regexp(r"^order:delete:\d+$"))
+    async def confirm_order_deletion(callback: CallbackQuery) -> None:
+        order_id = int((callback.data or "").rsplit(":", 1)[1])
+        if database.get_order(order_id) is None:
+            await callback.answer("Заказ не найден.", show_alert=True)
+            return
+        await callback.answer()
+        await _edit_callback_message(
+            callback,
+            f"⚠️ <b>Удалить заказ №{order_id} из истории?</b>\n"
+            "Будут удалены его позиции, информация об оплате и журнал правок. "
+            "Действие нельзя отменить.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _button("🗑 Да, удалить", f"order:delete:confirm:{order_id}"),
+                        _button("↩️ Отмена", f"order:{order_id}"),
+                    ]
+                ]
+            ),
+        )
+
+    @router.callback_query(F.data.regexp(r"^order:delete:confirm:\d+$"))
+    async def delete_order_from_history(
+        callback: CallbackQuery, user_id: int
+    ) -> None:
+        order_id = int((callback.data or "").rsplit(":", 1)[1])
+        try:
+            deleted = database.delete_order(order_id)
+        except sqlite3.Error:
+            logger.exception(
+                "Order deletion failed: user_id=%s order_id=%s",
+                user_id,
+                order_id,
+            )
+            await callback.answer(
+                "Не удалось удалить заказ из-за ошибки базы данных.",
+                show_alert=True,
+            )
+            return
+        if not deleted:
+            await callback.answer("Заказ уже удалён или не найден.", show_alert=True)
+            return
+
+        logger.info("Order deleted from history: user_id=%s order_id=%s", user_id, order_id)
+        await callback.answer("Заказ удалён.")
+        text, markup = orders_view(database, 0)
+        await _edit_callback_message(callback, text, markup)
 
     @router.callback_query(F.data.startswith("order:audit:"))
     async def order_audit(callback: CallbackQuery) -> None:
@@ -1909,7 +2121,7 @@ def create_router(database: Database) -> Router:
         await _edit_callback_message(
             callback,
             "Введите новую общую сумму заказа в целых рублях. "
-            "После этого укажите наличные и перевод.",
+            "После этого укажите наличные, перевод и терминал.",
             _cancel_markup(),
         )
 
@@ -1918,19 +2130,22 @@ def create_router(database: Database) -> Router:
         today = datetime.now(MOSCOW_TZ).date().isoformat()
         report = database.today_report(today)
         logger.info(
-            "Daily report viewed: date=%s total=%s cash=%s transfer=%s orders=%s",
+            "Daily report viewed: date=%s total=%s cash=%s transfer=%s "
+            "terminal=%s orders=%s",
             today,
             report["total"],
             report["cash"],
             report["transfer"],
+            report["terminal"],
             report["order_count"],
         )
         await message.answer(
             f"📊 <b>Отчёт за {datetime.now(MOSCOW_TZ):%d.%m.%Y}</b>\n\n"
-            f"Всего: <b>{format_rubles(report['total'])}</b>\n"
-            f"💵 Наличные: {format_rubles(report['cash'])}\n"
+            f"📦 Заказов: {report['order_count']}\n"
             f"💳 Переводы: {format_rubles(report['transfer'])}\n"
-            f"📦 Заказов: {report['order_count']}",
+            f"💵 Наличные: {format_rubles(report['cash'])}\n"
+            f"🏧 Терминал: {format_rubles(report['terminal'])}\n\n"
+            f"<b>Итого: {format_rubles(report['total'])}</b>",
             reply_markup=settings_keyboard(telegram_user_id),
             parse_mode=ParseMode.HTML,
         )
@@ -2030,7 +2245,7 @@ def create_router(database: Database) -> Router:
         if navigation:
             buttons.append(navigation)
         return (
-            "📦 <b>История заказов</b>\nВыберите заказ:",
+            "📦 <b>История заказов</b>\nВыберите заказ 👇:",
             InlineKeyboardMarkup(inline_keyboard=buttons),
         )
 

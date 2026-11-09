@@ -101,7 +101,8 @@ class Database:
                     id INTEGER PRIMARY KEY,
                     order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
                     cash_amount INTEGER NOT NULL CHECK (cash_amount >= 0),
-                    transfer_amount INTEGER NOT NULL CHECK (transfer_amount >= 0)
+                    transfer_amount INTEGER NOT NULL CHECK (transfer_amount >= 0),
+                    terminal_amount INTEGER NOT NULL DEFAULT 0 CHECK (terminal_amount >= 0)
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY,
@@ -145,6 +146,15 @@ class Database:
                 connection.execute(
                     "ALTER TABLE products ADD COLUMN price_override "
                     "INTEGER NOT NULL DEFAULT 0"
+                )
+            payment_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(payments)")
+            }
+            if "terminal_amount" not in payment_columns:
+                connection.execute(
+                    "ALTER TABLE payments ADD COLUMN terminal_amount "
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (terminal_amount >= 0)"
                 )
             connection.execute(
                 "UPDATE products SET source_price_per_10g = price_per_10g "
@@ -655,8 +665,10 @@ class Database:
                 (user_id,),
             )
 
-    def checkout(self, user_id: int, cash: int, transfer: int) -> int:
-        if cash < 0 or transfer < 0:
+    def checkout(
+        self, user_id: int, cash: int, transfer: int, terminal: int = 0
+    ) -> int:
+        if min(cash, transfer, terminal) < 0:
             raise ValueError("Суммы оплаты не могут быть отрицательными.")
         now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
         with self._connect() as connection:
@@ -675,8 +687,8 @@ class Database:
             if not items:
                 raise ValueError("Корзина пуста.")
             total = sum(self._cart_item_total(item) for item in items)
-            if cash + transfer != total:
-                raise ValueError("Наличные и перевод должны равняться сумме заказа.")
+            if cash + transfer + terminal != total:
+                raise ValueError("Суммы оплат должны равняться сумме заказа.")
 
             order_cursor = connection.execute(
                 "INSERT INTO orders (user_id, created_at, total_amount) VALUES (?, ?, ?)",
@@ -701,9 +713,10 @@ class Database:
                     ),
                 )
             connection.execute(
-                "INSERT INTO payments (order_id, cash_amount, transfer_amount) "
-                "VALUES (?, ?, ?)",
-                (order_id, cash, transfer),
+                "INSERT INTO payments "
+                "(order_id, cash_amount, transfer_amount, terminal_amount) "
+                "VALUES (?, ?, ?, ?)",
+                (order_id, cash, transfer, terminal),
             )
             connection.execute("DELETE FROM cart_items WHERE cart_id = ?", (cart["id"],))
             return order_id
@@ -726,7 +739,7 @@ class Database:
             order = connection.execute(
                 """
                 SELECT o.id, o.created_at, o.total_amount, u.telegram_id,
-                       p.cash_amount, p.transfer_amount
+                       p.cash_amount, p.transfer_amount, p.terminal_amount
                 FROM orders o
                 JOIN users u ON u.id = o.user_id
                 JOIN payments p ON p.order_id = o.id
@@ -746,6 +759,20 @@ class Database:
             )
             return {"order": order, "items": items}
 
+    def delete_order(self, order_id: int) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if exists is None:
+                return False
+            connection.execute(
+                "DELETE FROM audit_log WHERE order_id = ?", (order_id,)
+            )
+            connection.execute("DELETE FROM orders WHERE id = ?", (order_id,))
+        return True
+
     def update_order_finances(
         self,
         order_id: int,
@@ -753,11 +780,12 @@ class Database:
         total: int,
         cash: int,
         transfer: int,
+        terminal: int = 0,
     ) -> None:
-        if min(total, cash, transfer) < 0:
+        if min(total, cash, transfer, terminal) < 0:
             raise ValueError("Суммы не могут быть отрицательными.")
-        if cash + transfer != total:
-            raise ValueError("Наличные и перевод должны равняться общей сумме.")
+        if cash + transfer + terminal != total:
+            raise ValueError("Суммы оплат должны равняться общей сумме.")
         now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -765,7 +793,8 @@ class Database:
                 "SELECT total_amount FROM orders WHERE id = ?", (order_id,)
             ).fetchone()
             old_payment = connection.execute(
-                "SELECT cash_amount, transfer_amount FROM payments WHERE order_id = ?",
+                "SELECT cash_amount, transfer_amount, terminal_amount "
+                "FROM payments WHERE order_id = ?",
                 (order_id,),
             ).fetchone()
             if old_order is None or old_payment is None:
@@ -774,14 +803,19 @@ class Database:
                 "total_amount": (int(old_order["total_amount"]), total),
                 "cash_amount": (int(old_payment["cash_amount"]), cash),
                 "transfer_amount": (int(old_payment["transfer_amount"]), transfer),
+                "terminal_amount": (
+                    int(old_payment["terminal_amount"]),
+                    terminal,
+                ),
             }
             connection.execute(
                 "UPDATE orders SET total_amount = ? WHERE id = ?", (total, order_id)
             )
             connection.execute(
-                "UPDATE payments SET cash_amount = ?, transfer_amount = ? "
+                "UPDATE payments SET cash_amount = ?, transfer_amount = ?, "
+                "terminal_amount = ? "
                 "WHERE order_id = ?",
-                (cash, transfer, order_id),
+                (cash, transfer, terminal, order_id),
             )
             for field_name, (old_value, new_value) in values.items():
                 if old_value != new_value:
@@ -822,6 +856,7 @@ class Database:
                 SELECT COALESCE(SUM(o.total_amount), 0) AS total,
                        COALESCE(SUM(p.cash_amount), 0) AS cash,
                        COALESCE(SUM(p.transfer_amount), 0) AS transfer,
+                       COALESCE(SUM(p.terminal_amount), 0) AS terminal,
                        COUNT(o.id) AS order_count
                 FROM orders o JOIN payments p ON p.order_id = o.id
                 WHERE substr(o.created_at, 1, 10) = ?
